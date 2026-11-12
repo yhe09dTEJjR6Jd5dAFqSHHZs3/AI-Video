@@ -1,6 +1,5 @@
 import concurrent.futures
 import difflib
-import tempfile
 import ctypes
 import datetime
 import gc
@@ -35,9 +34,9 @@ from collections import deque
 from pathlib import Path, PurePosixPath
 
 APP_NAME = "离线 AI 视频工坊"
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.4.3"
 RUNTIME_VERSION = "2026.11.12.6"
-PIPELINE_VERSION = "2026.11.12.6"
+PIPELINE_VERSION = "2026.11.12.9"
 MIN_PYTHON = (3, 10)
 MAX_PYTHON = (3, 13)
 GB = 1024 ** 3
@@ -93,6 +92,16 @@ VOICE_SHA256 = "9929917bf8cabb26fd528ea44d3a6699c11e87317a14765312420be230be0f3d
 VOICE_PACKAGES = ("piper-tts==1.8.0",)
 MODEL_CHECK_MIN_BYTES = 1024 * 1024
 MODEL_HASH_SAMPLE_BYTES = 64 * 1024
+MODEL_HASH_VERIFICATION_FILE = ".hash-verification"
+GPU_CRITICAL_FREE_BYTES = 512 * 1024 * 1024
+DURATION_TIME_CONTEXT_CHARS = 32
+MIN_REQUEST_DURATION = 6
+MAX_REQUEST_DURATION = 120
+NATIVE_BACKGROUND_BANDWIDTH_BYTES = 4 * 1024 * 1024
+NATIVE_DOWNLOAD_CHUNK_BYTES = 512 * 1024
+NETWORK_COST_CHECK_INTERVAL = 60
+NATIVE_DOWNLOAD_FILE_LIMIT = 256 * 1024 * 1024
+WINDOWS_11_MIN_BUILD = 22000
 TORCH_VERSION = "2.7.1"
 CUDA_MIN_TOTAL_MB = 4096
 CUDA_MIN_FREE_BYTES = 3 * GB
@@ -132,6 +141,8 @@ NATIVE_VIDEO_MAX_SLOWDOWN = 1.5
 NATIVE_REVIEW_FRACTIONS = (.02, .17, .34, .50, .66, .83, .98)
 MODEL_INTEGRITY_EXTENSIONS = {".bin", ".safetensors", ".json", ".model", ".txt", ".py", ".onnx"}
 RESOURCE_MONITOR_INTERVAL = 5
+NETWORK_COST_CACHE = {"checked": 0.0, "result": None}
+NETWORK_COST_LOCK = threading.Lock()
 DOWNLOAD_SPACE_MULTIPLIER = 1.4
 MODEL_SIZE_ESTIMATES = {"director": 2 * GB, "painter": 3 * GB, "listener": GB, "inspector": GB, "voice": GB // 2}
 MIN_CAPTION_FONT = 13
@@ -206,6 +217,20 @@ MODEL_DOWNLOAD_SECURITY_SUFFIXES = {".safetensors", ".json", ".model", ".txt"}
 RESOURCE_PRESSURE_STREAK = 2
 RESOURCE_MONITOR_CPU_LIMIT = 0.86
 RESOURCE_MAX_CPU_SHARE = 0.65
+RESOURCE_BUSY_IMAGE_FRACTION = 0.82
+RESOURCE_BUSY_STEPS_FRACTION = 0.85
+RESOURCE_BUSY_PAUSE_SECONDS = 2.4
+RESOURCE_BUSY_POLL_SECONDS = 0.3
+RESOURCE_MEMORY_WAIT_SECONDS = 1.6
+RUNTIME_SNAPSHOT_RESERVE_BYTES = GB // 2
+RUNTIME_MARKER_BACKUP = "packages_ready.rollback.json"
+PDF_PAGE_TEXT_MIN_CHARS = 32
+PDF_OCR_MISSING_MARKER = "[未完整识别第"
+VISUAL_CONTINUITY_THRESHOLD = 0.71
+VISUAL_CONTINUITY_PATTERN = re.compile(
+    r"同一(?:个|位|名)?(?:人物|人|角色|演员|主角)|人物(?:身份|外观|服装)一致|角色(?:形象|外观)一致|"
+    r"same (?:person|character|actor)|consistent (?:character|actor|person)", re.I)
+
 DOCUMENT_REQUIRED_PATTERN = re.compile(r"必须|严格按照|严格依据|仅根据|完全根据|务必引用|以.*(?:文档|材料|附件|资料).*为准|根据.*(?:文档|资料|附件)")
 
 CORE_PACKAGE_SPECS = (
@@ -307,15 +332,73 @@ def memory_info():
     return {"total": 0, "available": 0}
 
 
+def nvidia_smi_paths():
+    programs = []
+    discovered = shutil.which("nvidia-smi")
+    if discovered:
+        programs.append(discovered)
+    if os.name == "nt":
+        for variable in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"):
+            location = os.environ.get(variable)
+            if location:
+                programs.append(str(Path(location) / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe"))
+        system = os.environ.get("SystemRoot", r"C:\Windows")
+        programs.append(str(Path(system) / "System32" / "nvidia-smi.exe"))
+    return list(dict.fromkeys(str(Path(item)) for item in programs if Path(item).is_file()))
+
+
+WINDOWS_NVIDIA_CACHE = {"checked": 0.0, "devices": []}
+
+
+def windows_nvidia_fallback():
+    if os.name != "nt":
+        return []
+    current = time.monotonic()
+    if current - WINDOWS_NVIDIA_CACHE["checked"] < 60:
+        return [dict(item) for item in WINDOWS_NVIDIA_CACHE["devices"]]
+    flags = subprocess.CREATE_NO_WINDOW
+    command = ("Get-CimInstance Win32_VideoController | "
+               "Where-Object { $_.Name -match 'NVIDIA' } | "
+               "Select-Object Name,AdapterRAM | ConvertTo-Json -Compress")
+    try:
+        result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+                                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                timeout=12, creationflags=flags)
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        parsed = json.loads(result.stdout)
+        records = parsed if isinstance(parsed, list) else [parsed]
+        devices = []
+        for item in records:
+            if not isinstance(item, dict) or "NVIDIA" not in str(item.get("Name", "")).upper():
+                continue
+            try:
+                ram = max(0, int(item.get("AdapterRAM") or 0))
+            except (ValueError, TypeError):
+                ram = 0
+            devices.append({"index": len(devices), "physical_index": len(devices),
+                            "name": str(item["Name"]), "total_mb": ram // (1024 * 1024),
+                            "free_mb": 0, "driver": "", "uuid": "",
+                            "detected_without_smi": True})
+        WINDOWS_NVIDIA_CACHE.update({"checked": time.monotonic(), "devices": devices})
+        return devices
+    except (OSError, ValueError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        WINDOWS_NVIDIA_CACHE.update({"checked": time.monotonic(), "devices": []})
+        return []
+
+
 def gpu_info():
     result = {"name": "", "free_mb": 0, "total_mb": 0, "driver": "", "index": None, "devices": []}
-    try:
-        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        proc = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.free,memory.total,driver_version,uuid",
-                               "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=6,
-                              creationflags=flags)
-        devices = []
-        if proc.returncode == 0:
+    devices = []
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    for executable in nvidia_smi_paths():
+        try:
+            proc = subprocess.run([executable,
+                                   "--query-gpu=index,name,memory.free,memory.total,driver_version,uuid",
+                                   "--format=csv,noheader,nounits"], capture_output=True, text=True,
+                                  timeout=6, creationflags=flags)
+            if proc.returncode != 0:
+                continue
             for line in proc.stdout.splitlines():
                 fields = [field.strip() for field in line.split(",")]
                 if len(fields) < 6:
@@ -326,23 +409,28 @@ def gpu_info():
                                     "total_mb": int(fields[3]), "driver": fields[4], "uuid": fields[5]})
                 except (ValueError, IndexError):
                     continue
-        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if visible is not None:
-            ordered = []
-            for token in (part.strip() for part in visible.split(",")):
-                if not token or token == "-1":
-                    continue
-                found = next((item for item in devices if token == str(item["physical_index"]) or
-                              token == item["uuid"] or item["uuid"].startswith(token)), None)
-                if found is not None and found not in ordered:
-                    ordered.append(found)
-            devices = [{**item, "index": index} for index, item in enumerate(ordered)]
-        if devices:
-            preferred = max(devices, key=lambda item: (item["free_mb"], item["total_mb"]))
-            result.update(preferred)
-            result["devices"] = devices
-    except (ValueError, OSError, subprocess.TimeoutExpired):
-        pass
+            if devices:
+                break
+        except (ValueError, OSError, subprocess.TimeoutExpired):
+            continue
+    if not devices:
+        devices = windows_nvidia_fallback()
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None:
+        ordered = []
+        for token in (part.strip() for part in visible.split(",")):
+            if not token or token == "-1":
+                continue
+            found = next((item for item in devices if token == str(item["physical_index"]) or
+                          (item.get("uuid") and (token == item["uuid"] or
+                                                   item["uuid"].startswith(token)))), None)
+            if found is not None and found not in ordered:
+                ordered.append(found)
+        devices = [{**item, "index": index} for index, item in enumerate(ordered)]
+    if devices:
+        preferred = max(devices, key=lambda item: (item["free_mb"], item["total_mb"]))
+        result.update(preferred)
+        result["devices"] = devices
     return result
 
 
@@ -395,6 +483,39 @@ class ResourceGovernor:
         self._cpu_busy = None
         self._power = system_power_state()
         self._power_checked = 0.0
+        self._cpu_runtime = None
+        self._cpu_threads_base = None
+        self._cpu_threads_active = None
+        self._cpu_throttle_events = []
+
+    def attach_runtime(self, module):
+        with self._lock:
+            self._cpu_runtime = module
+            self._cpu_threads_base = max(1, available_threads())
+            self._cpu_threads_active = self._cpu_threads_base
+
+    def adjust_cpu_threads(self, sample, stage):
+        module = self._cpu_runtime
+        if module is None or self._cpu_threads_base is None:
+            return
+        busy = sample.get("cpu_busy")
+        limit = self._cpu_threads_base
+        if sample.get("on_battery"):
+            limit = max(1, int(limit * BATTERY_RESOURCE_FRACTION))
+        if busy is not None and busy > RESOURCE_MONITOR_CPU_LIMIT:
+            limit = max(1, min(limit, int(self._cpu_threads_base * RESOURCE_MAX_CPU_SHARE)))
+        if limit == self._cpu_threads_active:
+            return
+        try:
+            module.set_num_threads(limit)
+        except (RuntimeError, ValueError, OSError):
+            return
+        with self._lock:
+            self._cpu_threads_active = limit
+            self._cpu_throttle_events.append({"stage": str(stage)[:80], "at": sample["at"],
+                                              "threads": limit, "cpu_busy": busy,
+                                              "on_battery": sample.get("on_battery")})
+            self._cpu_throttle_events = self._cpu_throttle_events[-RESOURCE_METRICS_LIMIT:]
 
     def attach_cuda(self, torch_module=None, index=None):
         with self._lock:
@@ -501,33 +622,52 @@ class ResourceGovernor:
         return sample
 
     def adaptive_pause(self, stage, cancel=None, notify=None, allowance=4):
+        paused_cpu = False
+        start_time = time.monotonic()
         for number in range(allowance + 1):
             if cancel is not None and cancel.is_set():
                 raise InterruptedError("已停止")
             sample = self.snapshot(stage)
+            self.adjust_cpu_threads(sample, stage)
             total = sample["ram_total"]
             pressure = bool(total and sample["ram_available"] < max(
                 MIN_SYSTEM_MEMORY_HEADROOM, int(total * SYSTEM_MEMORY_RESERVE_FRACTION)))
-            busy_cpu = sample.get("cpu_busy") is not None and sample["cpu_busy"] > RESOURCE_MONITOR_CPU_LIMIT
+            busy_cpu = (sample.get("cpu_busy") is not None and
+                        sample["cpu_busy"] > RESOURCE_MONITOR_CPU_LIMIT)
             on_battery = sample.get("on_battery")
             if not pressure:
-                if busy_cpu and number == 0:
-                    if notify:
-                        notify("检测到其他任务较忙，降低本进程负载后继续")
-                    time.sleep(.85 if on_battery else .4)
-                elif on_battery:
-                    time.sleep(.2)
+                if busy_cpu and not paused_cpu and notify:
+                    notify("检测到其他任务繁忙，已减少 CPU 并发并主动让出计算时间")
+                if busy_cpu and time.monotonic() - start_time < RESOURCE_BUSY_PAUSE_SECONDS:
+                    paused_cpu = True
+                    wait_seconds = min(RESOURCE_BUSY_POLL_SECONDS,
+                                       RESOURCE_BUSY_PAUSE_SECONDS - (time.monotonic() - start_time))
+                    if wait_seconds > 0:
+                        if cancel is not None and cancel.wait(wait_seconds):
+                            raise InterruptedError("已停止")
+                        if cancel is None:
+                            time.sleep(wait_seconds)
+                    continue
+                if on_battery:
+                    if cancel is not None and cancel.wait(RESOURCE_BUSY_POLL_SECONDS):
+                        raise InterruptedError("已停止")
+                    if cancel is None:
+                        time.sleep(RESOURCE_BUSY_POLL_SECONDS)
                 return sample
             with self._lock:
                 self.pressure_events.append({"stage": stage, "at": sample["at"],
                                              "ram_available": sample["ram_available"]})
                 self.pressure_events = self.pressure_events[-RESOURCE_METRICS_LIMIT:]
-            if number == allowance:
+            if number >= allowance:
                 raise RuntimeError("其他软件占用较多内存，已保护设备并停止当前阶段：" + stage)
             if notify:
-                notify("检测到其他程序占用大量内存，短暂等待并降低创作负载")
+                notify("检测到可用内存不足，释放缓存并等待其他程序释放资源")
             gc.collect()
-            time.sleep(min(2, .5 + number * .35))
+            delay = min(RESOURCE_MEMORY_WAIT_SECONDS, RESOURCE_BUSY_POLL_SECONDS * (number + 2))
+            if cancel is not None and cancel.wait(delay):
+                raise InterruptedError("已停止")
+            if cancel is None:
+                time.sleep(delay)
 
     def image_profile(self, quality, device="cpu", torch_free=None):
         sample = self.snapshot("image_profile")
@@ -538,7 +678,11 @@ class ResourceGovernor:
         if sample.get("on_battery"):
             available = int(available * BATTERY_RESOURCE_FRACTION)
             ram = int(ram * BATTERY_RESOURCE_FRACTION)
-        return image_resource_profile(quality, device, ram, max(0, available))
+        profile = image_resource_profile(quality, device, ram, max(0, available))
+        if sample.get("cpu_busy") is not None and sample["cpu_busy"] > RESOURCE_MONITOR_CPU_LIMIT:
+            return (max(MIN_IMAGE_DIMENSION, int(profile[0] * RESOURCE_BUSY_IMAGE_FRACTION) // 8 * 8),
+                    max(6, int(profile[1] * RESOURCE_BUSY_STEPS_FRACTION)))
+        return profile
 
     def ensure(self, stage, required=0, disk_required=0):
         sample = self.snapshot(stage)
@@ -555,13 +699,16 @@ class ResourceGovernor:
                     "minimum_available_gpu": self.lowest_available_gpu,
                     "resource_stop_reason": self.resource_stop_reason,
                     "power": dict(self._power), "cpu_busy": self._cpu_busy,
-                    "pressure_events": list(self.pressure_events), "samples": list(self.samples)}
+                    "pressure_events": list(self.pressure_events),
+                    "cpu_throttle_events": list(self._cpu_throttle_events),
+                    "cpu_threads_active": self._cpu_threads_active,
+                    "samples": list(self.samples)}
 
 def torch_install_sources(gpu, package_indexes):
     sources = []
     match = re.match(r"^(\d+)", str(gpu.get("driver", "")))
     major = int(match.group(1)) if match else 0
-    if gpu.get("total_mb", 0) >= CUDA_MIN_TOTAL_MB:
+    if gpu.get("total_mb", 0) >= CUDA_MIN_TOTAL_MB or gpu.get("detected_without_smi"):
         if major >= 570:
             sources.append(("CUDA 12.8", TORCH_WHEEL_INDEX + "/cu128", True))
         if major >= 560:
@@ -571,6 +718,93 @@ def torch_install_sources(gpu, package_indexes):
     sources.append(("CPU", TORCH_WHEEL_INDEX + "/cpu", False))
     sources.extend(("CPU 备用源", index, False) for index in package_indexes)
     return sources
+
+
+def host_install_preflight(root):
+    import importlib.util
+    unsupported = [name for name in ("ssl", "venv", "ensurepip", "tkinter")
+                   if importlib.util.find_spec(name) is None]
+    if unsupported:
+        raise RuntimeError("当前 Python 安装不完整，缺少 " + ", ".join(unsupported) + "；请安装带 Tcl/Tk、pip 和 venv 的正式 64 位 Python")
+    if os.name == "nt":
+        if sys.getwindowsversion().build < WINDOWS_11_MIN_BUILD:
+            raise RuntimeError("系统版本低于 Windows 11 build 22000")
+        if struct.calcsize("P") != 8:
+            raise RuntimeError("当前 Python 不是 64 位解释器")
+    root = Path(root)
+    if len(str(root)) + MIN_WORKSPACE_PATH_MARGIN >= 240 and os.name == "nt":
+        raise RuntimeError("工作目录路径过长，不适合存储深层模型文件")
+    transaction = root / (".studio_preflight_" + secrets.token_hex(6))
+    destination = transaction.with_suffix(".checked")
+    try:
+        transaction.write_bytes(b"ok")
+        os.replace(transaction, destination)
+        if destination.read_bytes() != b"ok":
+            raise RuntimeError("选定目录不支持可靠写入和重命名")
+    finally:
+        transaction.unlink(missing_ok=True)
+        destination.unlink(missing_ok=True)
+    free = shutil.disk_usage(root).free
+    detected = gpu_info()
+    return {"python": list(sys.version_info[:2]), "architecture_bits": struct.calcsize("P") * 8,
+            "system_build": sys.getwindowsversion().build if os.name == "nt" else None,
+            "disk_free_gb": round(free / GB, 2),
+            "gpu_mode": "nvidia_cuda_candidate" if detected.get("devices") else "cpu_fallback",
+            "nvidia_driver": detected.get("driver", ""),
+            "nvidia_total_mb": detected.get("total_mb", 0)}
+
+
+def installation_failure_hint(error):
+    message = str(error).lower()
+    if any(word in message for word in ("no space left", "disk full", "winerror 112", "磁盘空间不足", "空间不足")):
+        return "disk_full", "磁盘空间不足，请更换工作目录或清理空间"
+    if any(word in message for word in ("no matching distribution", "not a supported wheel", "requires-python", "unsupported python")):
+        return "incompatible_package", "安装包与当前 Python/Windows 版本不兼容"
+    if any(word in message for word in ("sha-256", "sha256", "hash mismatch", "校验失败", "校验结果不符")):
+        return "integrity_failed", "下载数据校验失败，请保留工作目录并重试"
+    if any(word in message for word in ("winerror 5", "permission denied", "access is denied", "拒绝访问")):
+        return "permission_denied", "工作目录或缓存文件权限不足"
+    if any(word in message for word in ("certificate verify failed", "sslerror", "tlsv", "certificate_verify")):
+        return "certificate_error", "TLS 证书验证失败，请检查 Windows 证书和网络设置"
+    if any(word in message for word in ("404", "not found", "repositorynotfounderror", "entrynotfounderror")):
+        return "resource_missing", "安装源或固定版本资源不可用，将尝试备用线路"
+    if any(word in message for word in ("timeout", "timed out", "name resolution", "temporary failure", "network is unreachable", "连接超时", "无法连接")):
+        return "network_unavailable", "网络不可达或请求超时，将尝试备用线路"
+    return "unclassified", "可根据黑匣子中的日志判断失败位置"
+
+
+def windows_network_cost(force=False):
+    if os.name != "nt":
+        return {"known": False, "metered": True, "type": "unsupported_platform"}
+    with NETWORK_COST_LOCK:
+        when = time.monotonic()
+        previous = NETWORK_COST_CACHE["result"]
+        if not force and previous is not None and when - NETWORK_COST_CACHE["checked"] < NETWORK_COST_CHECK_INTERVAL:
+            return dict(previous)
+        script = ("$ErrorActionPreference='Stop';"
+                  "$p=[Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime]::GetInternetConnectionProfile();"
+                  "if($null -eq $p){'none';exit};"
+                  "$c=$p.GetConnectionCost();"
+                  "'{0},{1},{2},{3}' -f $c.NetworkCostType,$c.Roaming,$c.OverDataLimit,$c.ApproachingDataLimit")
+        result = {"known": False, "metered": True, "type": "unknown"}
+        try:
+            flags = subprocess.CREATE_NO_WINDOW
+            completed = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                                       capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                       timeout=12, creationflags=flags)
+            lines = completed.stdout.strip().splitlines()
+            if completed.returncode == 0 and lines:
+                values = [item.strip().lower() for item in lines[-1].split(",")]
+                if len(values) == 4 and values[0] in {"unrestricted", "fixed", "variable", "unknown"}:
+                    is_metered = (values[0] != "unrestricted" or any(
+                        flag == "true" for flag in values[1:]))
+                    result = {"known": values[0] != "unknown", "metered": is_metered,
+                              "type": values[0], "roaming": values[1] == "true",
+                              "over_limit": values[2] == "true", "near_limit": values[3] == "true"}
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+        NETWORK_COST_CACHE.update({"checked": when, "result": result})
+        return dict(result)
 
 
 def image_resource_profile(quality, device, available_ram, available_gpu):
@@ -692,15 +926,27 @@ def runtime_matches_host(root):
         return False
 
 
+def runtime_snapshot_copy(source, target):
+    return shutil.copy2(source, target)
+
 def recover_runtime_transaction(root):
     folder = Path(root) / ".studio"
     existing = folder / "venv"
     backup = folder / RUNTIME_BACKUP_FOLDER
+    snapshot_staging = folder / (RUNTIME_BACKUP_FOLDER + ".creating")
+    if snapshot_staging.is_dir():
+        shutil.rmtree(snapshot_staging)
     if not backup.is_dir():
         return False
     if existing.exists():
         shutil.rmtree(existing)
     os.replace(backup, existing)
+    marker = folder / "packages_ready.json"
+    marker_backup = folder / RUNTIME_MARKER_BACKUP
+    if marker_backup.is_file():
+        os.replace(marker_backup, marker)
+    else:
+        marker.unlink(missing_ok=True)
     return True
 
 
@@ -713,15 +959,22 @@ def installation_disk_budget(root, tier="basic", needs_piper=False, replacement=
         missing.append("voice")
     expected_models = sum(MODEL_SIZE_ESTIMATES.get(name, GB) for name in missing)
     existing_venv = root / ".studio" / "venv"
-    occupied = sum(file.stat().st_size for file in existing_venv.rglob("*") if file.is_file()) if existing_venv.is_dir() else 0
+    occupied = 0
+    if existing_venv.is_dir():
+        for filename in existing_venv.rglob("*"):
+            if filename.is_file() and not filename.is_symlink():
+                occupied += filename.stat().st_size
     engine = (5 * GB if gpu_info().get("total_mb", 0) >= CUDA_MIN_TOTAL_MB else 3 * GB)
     library_cost = GB if tier == "basic" else 2 * GB
+    snapshot_cost = (max(RUNTIME_SNAPSHOT_RESERVE_BYTES, occupied)
+                     if existing_venv.is_dir() and not replacement else 0)
+    additional_runtime = (engine + library_cost if replacement or not existing_venv.is_dir()
+                          else library_cost + snapshot_cost)
     required = (MIN_JOB_FREE + MIN_DISK_CACHE_RESERVE +
-                int(expected_models * DOWNLOAD_SPACE_MULTIPLIER) +
-                (engine + library_cost if replacement or not existing_venv.is_dir() else library_cost))
+                int(expected_models * DOWNLOAD_SPACE_MULTIPLIER) + additional_runtime)
     return {"free": free, "required": required, "missing_models": missing,
-            "runtime_bytes": occupied, "replacement": replacement,
-            "tier": tier, "estimated_model_bytes": expected_models}
+            "runtime_bytes": occupied, "snapshot_budget_bytes": snapshot_cost,
+            "replacement": replacement, "tier": tier, "estimated_model_bytes": expected_models}
 
 
 def runtime_site(root):
@@ -774,6 +1027,14 @@ class StopSignal:
 
     def is_set(self):
         return self.filename.is_file()
+
+    def wait(self, seconds):
+        deadline = time.monotonic() + max(0, float(seconds))
+        while time.monotonic() < deadline:
+            if self.is_set():
+                return True
+            time.sleep(min(.12, max(0, deadline - time.monotonic())))
+        return self.is_set()
 
 
 def model_path(root, folder):
@@ -833,7 +1094,7 @@ def model_files_manifest(folder):
     return {entry.relative_to(folder).as_posix(): entry.stat().st_size
             for entry in folder.rglob("*")
             if entry.is_file() and ".cache" not in entry.relative_to(folder).parts
-            and entry.name != "download.json"}
+            and entry.name not in {"download.json", MODEL_HASH_VERIFICATION_FILE}}
 
 
 def pinned_model_weights_valid(folder, repo, hashes=None, deep=False):
@@ -885,7 +1146,7 @@ def model_integrity_manifest(folder):
             for path in folder.rglob("*") if path.is_file()
             and ".cache" not in path.relative_to(folder).parts
             and path.suffix.lower() in MODEL_INTEGRITY_EXTENSIONS
-            and path.name != "download.json"}
+            and path.name not in {"download.json", MODEL_HASH_VERIFICATION_FILE}}
 
 
 def model_full_sha256_manifest(folder):
@@ -893,7 +1154,43 @@ def model_full_sha256_manifest(folder):
     return {path.relative_to(folder).as_posix(): full_file_sha256(path)
             for path in folder.rglob("*") if path.is_file()
             and ".cache" not in path.relative_to(folder).parts
-            and path.name != "download.json"}
+            and path.name not in {"download.json", MODEL_HASH_VERIFICATION_FILE}}
+
+def full_hashes_verified(folder, expected_hashes, force=False):
+    folder = Path(folder)
+    if not isinstance(expected_hashes, dict) or not expected_hashes:
+        return False
+    records = []
+    try:
+        for relative, digest in sorted(expected_hashes.items()):
+            part = PurePosixPath(relative)
+            if (not isinstance(relative, str) or not part.parts or part.is_absolute() or
+                    ".." in part.parts or not isinstance(digest, str) or
+                    not re.fullmatch(r"[0-9a-f]{64}", digest)):
+                return False
+            file = folder.joinpath(*part.parts)
+            if not file.is_file() or file.is_symlink():
+                return False
+            stat = file.stat()
+            records.append((relative, digest, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+        token = hashlib.sha256(json.dumps(records, ensure_ascii=False,
+                                          separators=(",", ":")).encode("utf-8")).hexdigest()
+        stamp = folder / MODEL_HASH_VERIFICATION_FILE
+        if not force and read_json(stamp, {}).get("fingerprint") == token:
+            return True
+        for relative, digest, _, _, _ in records:
+            if not secrets.compare_digest(full_file_sha256(folder.joinpath(*PurePosixPath(relative).parts)), digest):
+                return False
+        for relative, _, size, mtime, ctime in records:
+            stat = folder.joinpath(*PurePosixPath(relative).parts).stat()
+            if (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns) != (size, mtime, ctime):
+                return False
+        atomic_json(stamp, {"fingerprint": token, "verified_at": datetime.datetime.now().isoformat(),
+                            "files": len(records)})
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
 
 def git_blob_sha1(path):
     size = Path(path).stat().st_size
@@ -1002,7 +1299,7 @@ def model_folder_complete(folder, spec, deep=False):
     if any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
            for value in full_hashes.values()):
         return False
-    if not pinned_model_weights_valid(folder, repo, full_hashes, deep=deep):
+    if not pinned_model_weights_valid(folder, repo, full_hashes, deep=False):
         return False
     integrity = marker.get("integrity")
     if not isinstance(integrity, dict) or not integrity:
@@ -1015,10 +1312,9 @@ def model_folder_complete(folder, spec, deep=False):
         item = folder / relative
         if not item.is_file() or file_integrity_hash(item) != signature:
             return False
+    if not full_hashes_verified(folder, full_hashes, force=deep):
+        return False
     if deep:
-        for relative, digest in full_hashes.items():
-            if full_file_sha256(folder / relative) != digest:
-                return False
         provenance = marker.get("source_metadata")
         if provenance:
             if (not isinstance(provenance, dict) or provenance.get("repo") != repo or
@@ -1090,8 +1386,8 @@ def optional_model_verified(folder, role, deep=False):
             return False
         if relative in checked_integrity and file_integrity_hash(item) != checked_integrity[relative]:
             return False
-        if deep and full_file_sha256(item) != digest:
-            return False
+    if not full_hashes_verified(folder, signatures, force=deep):
+        return False
     if not set(weight.relative_to(folder).as_posix() for weight in weights).issubset(checked_integrity):
         return False
     return not deep or verify_remote_file_hashes(folder, manifest["source_metadata"])
@@ -1324,9 +1620,15 @@ def native_video_folder_complete(folder, deep=False):
         if relative in signatures and (not isinstance(signatures[relative], str) or
                                        file_integrity_hash(file) != signatures[relative]):
             return False
-        if deep and full_file_sha256(file) != hashes[relative]:
-            return False
+    if not full_hashes_verified(folder, hashes, force=deep):
+        return False
     source = marker.get("source_metadata")
+    if (not isinstance(source, dict) or source.get("repo") != marker.get("repo") or
+            source.get("revision") != marker.get("revision") or
+            source.get("origin") not in {"https://huggingface.co", "https://hf-mirror.com"} or
+            (source.get("origin") != "https://huggingface.co" and
+             source.get("verification_level") != "mirror_safetensors_sha256_requires_offline_smoke")):
+        return False
     if any(file.suffix.lower() == ".bin" for file in folder.rglob("*.bin")):
         if not isinstance(source, dict) or not source.get("authoritative"):
             return False
@@ -1533,7 +1835,7 @@ def capability_report(root, request=None):
     files = request.get("files", {}) if isinstance(request, dict) else {}
     visual_assets = any(files.get(item) for item in ("图片", "首帧", "尾帧", "视频"))
     native_requested = bool(request and str(request.get("visual_mode", "")).startswith("原生AI视频"))
-    can_create = bool(complete or basic and visual_assets)
+    can_create = bool(complete)
     return {"basic": bool(basic), "image_generation": complete,
             "semantic_review": complete, "speech_review": complete,
             "ocr": optional_ocr_ready(root) if complete else False,
@@ -1543,7 +1845,7 @@ def capability_report(root, request=None):
             "native_gpu_free_mb": gpu.get("free_mb", 0),
             "visual_assets": bool(visual_assets), "native_requested": native_requested,
             "create_allowed": can_create, "offline": can_create, "full_offline": complete,
-            "review_level": "full" if complete else "technical_only" if can_create else "unavailable"}
+            "review_level": "full" if complete else "installing" if basic else "unavailable"}
 
 
 def require_request_capabilities(root, request):
@@ -1551,7 +1853,7 @@ def require_request_capabilities(root, request):
     if not capabilities["create_allowed"]:
         if not capabilities["basic"]:
             raise RuntimeError("基础离线分镜、配音和视频编码尚未通过验收，请完成基础部署")
-        raise RuntimeError("缺少离线生图模型且未提供图片或视频，请补充画面素材或等待扩展模型部署")
+        raise RuntimeError("完整离线图像生成及 AI 审校尚未验收；请等待扩展组件安装完成")
     if capabilities["native_requested"] and not capabilities["native_video"]:
         request["visual_mode"] = "智能轻量运镜"
         capabilities["native_fallback"] = "原生视频未通过实际推理验收或显存不足，改用图片动态运镜"
@@ -1810,47 +2112,190 @@ def download_model_worker(root, index, endpoint, deep=False):
     staging.replace(target)
 
 
+def native_repo_relative_path(name):
+    name = str(name)
+    relative = PurePosixPath(name)
+    if (not name or len(name) > 512 or relative.is_absolute() or
+            ".." in relative.parts or any(not part or part == "." or
+            part.split(".")[0].upper() in {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3",
+                                             "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+                                             "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+                                             "LPT7", "LPT8", "LPT9"} for part in name.split("/")) or
+            any(char in name for char in '<>:"\\|?*') or
+            any(ord(char) < 32 for char in name)):
+        raise RuntimeError("原生模型文件路径不符合 Windows 安全要求：" + name[:120])
+    if relative.suffix.lower() not in MODEL_DOWNLOAD_SECURITY_SUFFIXES:
+        raise RuntimeError("原生模型文件类型不允许：" + name[:120])
+    return relative
+
+
+def native_download_metadata(endpoint):
+    from huggingface_hub import HfApi
+    errors = []
+    for server in dict.fromkeys(("https://huggingface.co", endpoint)):
+        try:
+            info = HfApi(endpoint=server).model_info(repo_id=NATIVE_AUTO_REPO,
+                                                      files_metadata=True, timeout=SOURCE_METADATA_TIMEOUT)
+            revision = str(info.sha)
+            if not re.fullmatch(r"[0-9a-f]{40}", revision):
+                raise RuntimeError("模型仓库未提供合法的提交 SHA")
+            hashes, sizes = {}, {}
+            files = []
+            for sibling in info.siblings:
+                name = str(sibling.rfilename)
+                part = PurePosixPath(name)
+                if part.suffix.lower() not in MODEL_DOWNLOAD_SECURITY_SUFFIXES:
+                    continue
+                native_repo_relative_path(name)
+                files.append(name)
+                size = getattr(sibling, "size", None)
+                if isinstance(size, int) and size > 0:
+                    sizes[name] = size
+                lfs = getattr(sibling, "lfs", None)
+                digest = lfs.get("sha256") if isinstance(lfs, dict) else None
+                if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+                    hashes[name] = {"type": "sha256", "value": digest}
+                else:
+                    blob = getattr(sibling, "blob_id", None)
+                    if isinstance(blob, str) and re.fullmatch(r"[0-9a-f]{40}", blob):
+                        hashes[name] = {"type": "git-sha1", "value": blob}
+            weights = [name for name in files if name.endswith(".safetensors")]
+            if (not weights or any(hashes.get(name, {}).get("type") != "sha256" or
+                                   name not in sizes for name in weights)):
+                raise RuntimeError("原生视频模型的权重未提供完整 SHA-256 和文件大小")
+            if sum(sizes.get(name, 0) for name in files) < 2 * GB:
+                raise RuntimeError("原生视频模型文件大小异常")
+            metadata = {"repo": NATIVE_AUTO_REPO, "revision": revision,
+                        "origin": server, "authoritative": server == "https://huggingface.co",
+                        "verification_level": ("official_lfs_sha256" if server == "https://huggingface.co"
+                                               else "mirror_safetensors_sha256_requires_offline_smoke"),
+                        "hashes": hashes, "sizes": sizes}
+            if server != "https://huggingface.co":
+                metadata["official_errors"] = errors[-2:]
+            return files, metadata
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, urllib.error.URLError) as error:
+            errors.append("%s: %s" % (server, str(error)[:160]))
+    raise RuntimeError("原生模型官方与镜像元数据均未通过校验：" + " / ".join(errors))
+
+
+def native_file_hash_matches(path, record):
+    if not path.is_file() or not isinstance(record, dict):
+        return False
+    kind = record.get("type")
+    expected = record.get("value")
+    if kind == "sha256":
+        return bool(expected and secrets.compare_digest(full_file_sha256(path), expected))
+    if kind == "git-sha1":
+        return bool(expected and secrets.compare_digest(git_blob_sha1(path), expected))
+    return False
+
+
+def download_native_file(staging, endpoint, revision, name, metadata, throttle):
+    relative = native_repo_relative_path(name)
+    target = Path(staging).joinpath(*relative.parts)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    entry = metadata.get("hashes", {}).get(name, {})
+    expected_size = int(metadata.get("sizes", {}).get(name, 0))
+    if target.is_file() and (not expected_size or target.stat().st_size == expected_size):
+        if native_file_hash_matches(target, entry):
+            return
+        target.unlink()
+    partial = target.with_name(target.name + ".partial")
+    existing = partial.stat().st_size if partial.is_file() else 0
+    if expected_size and existing > expected_size:
+        partial.unlink()
+        existing = 0
+    if expected_size and existing == expected_size and native_file_hash_matches(partial, entry):
+        os.replace(partial, target)
+        return
+    url = (endpoint.rstrip("/") + "/" + NATIVE_AUTO_REPO + "/resolve/" +
+           urllib.parse.quote(revision, safe="") + "/" +
+           urllib.parse.quote(str(relative), safe="/"))
+    headers = {"User-Agent": "Offline-AI-Video/" + APP_VERSION,
+               "Accept-Encoding": "identity"}
+    if existing:
+        headers["Range"] = "bytes=%d-" % existing
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        response = urllib.request.urlopen(request, timeout=45)
+    except urllib.error.HTTPError as error:
+        if error.code == 416 and existing:
+            partial.unlink(missing_ok=True)
+            return download_native_file(staging, endpoint, revision, name, metadata, throttle)
+        raise
+    with response:
+        status = response.getcode()
+        if status not in (200, 206):
+            raise RuntimeError("原生模型下载返回异常 HTTP %s：%s" % (status, name))
+        if status == 206:
+            reported = str(response.headers.get("Content-Range", ""))
+            if not reported.startswith("bytes %d-" % existing):
+                raise RuntimeError("断点续传响应范围不匹配：" + name)
+        elif existing:
+            existing = 0
+        mode = "ab" if existing else "wb"
+        received = existing
+        ceiling = expected_size or NATIVE_DOWNLOAD_FILE_LIMIT
+        with partial.open(mode) as output:
+            while True:
+                chunk = response.read(NATIVE_DOWNLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > ceiling:
+                    raise RuntimeError("原生模型下载体积超过可信元数据声明：" + name)
+                output.write(chunk)
+                throttle["bytes"] += len(chunk)
+                delay = (throttle["bytes"] / NATIVE_BACKGROUND_BANDWIDTH_BYTES -
+                         (time.monotonic() - throttle["started"]))
+                if delay > 0:
+                    time.sleep(min(delay, 1.0))
+    if expected_size and partial.stat().st_size != expected_size:
+        raise RuntimeError("下载不完整，保留断点以供下次重试：" + name)
+    if not native_file_hash_matches(partial, entry):
+        partial.unlink(missing_ok=True)
+        raise RuntimeError("原生模型文件摘要不匹配，已移除损坏的部分：" + name)
+    os.replace(partial, target)
+    print("模型文件已验证：%s (%.2f GB)" % (name, target.stat().st_size / GB), flush=True)
+
+
 def download_native_worker(root, endpoint):
     configure_environment(root)
     os.environ["HF_ENDPOINT"] = endpoint
     os.environ["HF_HUB_OFFLINE"] = "0"
-    from huggingface_hub import HfApi, snapshot_download
     target = model_path(root, VIDEO_MODEL_FOLDER)
     if native_video_folder_complete(target):
         return
-    info = HfApi(endpoint="https://huggingface.co").model_info(
-        repo_id=NATIVE_AUTO_REPO, files_metadata=True, timeout=SOURCE_METADATA_TIMEOUT)
-    revision = str(info.sha)
-    if not re.fullmatch(r"[0-9a-f]{40}", revision):
-        raise RuntimeError("未能从官方仓库获取固定提交，已停止自动下载")
-    metadata = official_model_metadata(NATIVE_AUTO_REPO, revision, endpoint)
-    files = [item.rfilename for item in info.siblings if
-             Path(item.rfilename).suffix.lower() in MODEL_DOWNLOAD_SECURITY_SUFFIXES]
-    weights = [name for name in files if name.endswith(".safetensors")]
-    if not weights or any(name not in metadata["hashes"] for name in weights):
-        raise RuntimeError("原生模型权重没有完整的官方 SHA-256 校验数据")
+    files, metadata = native_download_metadata(endpoint)
+    revision = metadata["revision"]
+    if not metadata["authoritative"]:
+        print("官方仓库暂不可达，使用镜像的 safetensors SHA-256 校验；下载后仍需通过离线实际推理验收", flush=True)
     expected = sum(int(metadata["sizes"].get(name, 0)) for name in files)
-    if expected < 2 * GB:
-        raise RuntimeError("原生模型的远程文件大小异常，拒绝自动部署")
-    free_disk = shutil.disk_usage(root).free
-    if free_disk < NATIVE_AUTO_DISK_RESERVE + int(expected * DOWNLOAD_SPACE_MULTIPLIER):
-        raise RuntimeError("自动视频模型至少需 %.1f GB 磁盘空间，当前剩余 %.1f GB" % (
-            (NATIVE_AUTO_DISK_RESERVE + expected * DOWNLOAD_SPACE_MULTIPLIER) / GB, free_disk / GB))
     staging = target.with_name(target.name + ".downloading")
     staging.mkdir(parents=True, exist_ok=True)
     marker = read_json(staging / "download.json", {})
     if marker and marker.get("revision") != revision:
         shutil.rmtree(staging)
         staging.mkdir(parents=True, exist_ok=True)
-    snapshot_download(repo_id=NATIVE_AUTO_REPO, revision=revision, local_dir=str(staging),
-                      allow_patterns=files, max_workers=min(MAX_MODEL_DOWNLOAD_WORKERS, available_threads()),
-                      endpoint=endpoint)
-    if any(item.suffix.lower() == ".bin" for item in staging.rglob("*")):
+    existing = sum(min(int(metadata["sizes"].get(name, 0)),
+                       max((staging / name).stat().st_size if (staging / name).is_file() else 0,
+                           (staging / (name + ".partial")).stat().st_size if
+                           (staging / (name + ".partial")).is_file() else 0))
+                   for name in files)
+    free_disk = shutil.disk_usage(root).free
+    necessary = NATIVE_AUTO_DISK_RESERVE + int(max(0, expected - existing) * DOWNLOAD_SPACE_MULTIPLIER)
+    if free_disk < necessary:
+        raise RuntimeError("自动视频模型至少需 %.1f GB 磁盘空间，当前剩余 %.1f GB" % (
+            necessary / GB, free_disk / GB))
+    throttle = {"started": time.monotonic(), "bytes": 0}
+    for name in files:
+        download_native_file(staging, endpoint, revision, name, metadata, throttle)
+    if any(item.suffix.lower() == ".bin" for item in staging.rglob("*") if item.is_file()):
         raise RuntimeError("原生模型自动下载出现不安全的 pickle 权重，已拒绝加载")
     if not native_component_layout_valid(staging):
         raise RuntimeError("原生模型缺少必要组件或权重分片")
     if not verify_remote_file_hashes(staging, metadata):
-        raise RuntimeError("原生模型文件与官方提交 SHA 校验结果不符")
+        raise RuntimeError("原生模型文件与锁定提交 SHA 校验结果不符")
     manifest = model_files_manifest(staging)
     atomic_json(staging / "download.json", {
         "kind": "cogvideox", "complete": True, "repo": NATIVE_AUTO_REPO,
@@ -1863,7 +2308,6 @@ def download_native_worker(root, endpoint):
     if target.exists():
         shutil.rmtree(target)
     staging.replace(target)
-
 
 def download_voice_worker(root, endpoint):
     configure_environment(root)
@@ -2249,8 +2693,8 @@ def native_video_worker(root, prompt_path, output, quality, seconds=3.0, image_p
     configure_environment(root)
     os.environ.update({"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "DIFFUSERS_OFFLINE": "1"})
     model = native_video_model(root)
-    if model is None or not native_video_folder_complete(model[0], deep=True):
-        raise RuntimeError("原生视频模型的完整 SHA-256 校验失败，请重新导入并离线加载验收")
+    if model is None or not native_video_folder_complete(model[0]):
+        raise RuntimeError("原生视频模型未通过首次完整 SHA-256 或文件变更校验，请修复本地模型")
     import torch
     from diffusers import CogVideoXPipeline, CogVideoXImageToVideoPipeline
     from diffusers.utils import export_to_video
@@ -2292,7 +2736,18 @@ def native_video_worker(root, prompt_path, output, quality, seconds=3.0, image_p
     segments = []
     width, height = original_resolution
     try:
+        governor = ResourceGovernor(root)
         for number, count in enumerate(schedule):
+            governor.adaptive_pause("native_video_segment")
+            governor.ensure("native_video_segment", required=MIN_SYSTEM_MEMORY_HEADROOM,
+                            disk_required=MIN_JOB_FREE)
+            free_gpu, total_gpu = torch.cuda.mem_get_info(gpu_index)
+            if free_gpu < max(GPU_CRITICAL_FREE_BYTES, int(total_gpu * .025)):
+                smaller = native_smaller_resolution(aspect, (width, height), model[1])
+                if smaller is None:
+                    raise RuntimeError("其它程序占用过多显存，已停止大型视频推理以保护设备")
+                width, height = smaller
+                print("运行中显存紧张，后续镜头降低到 %d×%d" % (width, height), flush=True)
             generated = None
             params = {"prompt": prompt[:600], "num_frames": count,
                       "num_inference_steps": steps, "guidance_scale": 6.0,
@@ -2433,22 +2888,31 @@ def asset_sequence_for_scene(primary, extras, index, count, request):
     return sequence
 
 
-def distribute_unused_assets(scenes, assignments, unused, request, seconds, fps=DEFAULT_FPS):
+def distribute_unused_assets(scenes, assignments, unused, request, seconds, fps=DEFAULT_FPS,
+                             affinity=None):
     count = len(scenes)
     extras = {index: [] for index in range(count)}
     frames = [max(1, round(float(seconds[index]) * fps)) for index in range(count)]
     minimum = max(3, math.ceil(MIN_ASSET_SHOT_SECONDS * fps))
     remaining = []
-    for item in unused:
+    affinity = affinity or {}
+    for asset_index, item in enumerate(unused):
         possibilities = [index for index in range(count)
                          if (len(extras[index]) + (1 if index in assignments else 0) < MAX_ASSETS_PER_SCENE and
                              (len(extras[index]) + (2 if index in assignments else 1)) * minimum <= frames[index])]
         if not possibilities:
             remaining.append(item)
             continue
-        place = min(possibilities, key=lambda index: (
-            (len(extras[index]) + (1 if index in assignments else 0)) / max(1, frames[index]),
-            len(extras[index]), index))
+        matches = affinity.get(asset_index)
+        if matches and len(matches) == count:
+            place = max(possibilities, key=lambda index: (
+                float(matches[index]) if math.isfinite(float(matches[index])) else -1.0,
+                -((len(extras[index]) + (1 if index in assignments else 0)) / max(1, frames[index])),
+                -index))
+        else:
+            place = min(possibilities, key=lambda index: (
+                (len(extras[index]) + (1 if index in assignments else 0)) / max(1, frames[index]),
+                len(extras[index]), index))
         extras[place].append(item)
     if remaining:
         raise RuntimeError("所选素材超过当前成片的可观看时长，仍有 %d 个未能安排。请增加时长或减少素材，程序不会悄悄丢弃" % len(remaining))
@@ -2477,6 +2941,8 @@ def repair_action_for(code):
     if code in {"SPEECH_REVIEW_UNAVAILABLE", "SEMANTIC_REVIEW_UNAVAILABLE",
                 "TEMPORAL_REVIEW_UNAVAILABLE"}:
         return "restart_reviewer_and_recheck"
+    if code == "SCENE_SEMANTIC_UNVERIFIED":
+        return "repair_scene_visual"
     if code == "CAPTION_TIMELINE_MISSING":
         return "rebuild_timeline"
     if code in {"MIXED_VOICE_MISSING", "MIXED_SPEECH_MISMATCH", "MIXED_AUDIO_EXTRACTION_FAILED"}:
@@ -2488,6 +2954,8 @@ def repair_action_for(code):
         return "disable_synthetic_motion_keep_visual"
     if code in {"AUDIO_LOW", "AUDIO_SCAN_FAILED", "OUTPUT_MISSING"}:
         return "repair_audio_or_container"
+    if code == "SUPPLIED_SEMANTIC_CONFLICT":
+        return "replace_optional_supplied_visual"
     if code in {"SCENE_FRAME_INVALID", "FINAL_SEMANTIC_MISMATCH"}:
         return "repair_scene_visual"
     return "reencode_final_container"
@@ -2733,49 +3201,72 @@ def review_failure_type(review):
 
 
 def visual_constraints(text):
-    text = str(text)
-    colors = {"红色": "red", "蓝色": "blue", "绿色": "green", "黄色": "yellow", "黑色": "black",
-              "白色": "white", "紫色": "purple", "粉色": "pink", "金色": "gold", "银色": "silver"}
-    descriptions = [value for key, value in colors.items() if key in text]
-    for word in ("red", "blue", "green", "yellow", "black", "white", "purple", "pink", "gold", "silver"):
-        if re.search(r"\b" + word + r"\b", text, re.I):
-            descriptions.append(word)
-    descriptions += re.findall(r"(?<![A-Za-z0-9])\d+(?:\.\d+)?(?:\s*[%％]|\s*个|\s*只|\s*人|\s*辆)?", text)[:12]
-    digits = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6,
-              "七": 7, "八": 8, "九": 9, "十": 10}
-    units = {"个": "objects", "只": "objects", "人": "people", "位": "people", "辆": "vehicles",
-             "台": "units", "棵": "trees", "朵": "flowers", "把": "objects", "条": "objects",
-             "头": "animals", "匹": "animals", "枚": "objects", "架": "vehicles", "张": "objects"}
-    for match in re.finditer(r"([一二两三四五六七八九十]{1,3})(个|只|人|位|辆|台|棵|朵|把|条|头|匹|枚|架|张)", text):
-        token, unit = match.groups()
-        if "十" in token:
-            left, _, right = token.partition("十")
-            count = (digits.get(left, 1) if left else 1) * 10 + (digits.get(right, 0) if right else 0)
-        else:
-            count = digits.get(token, 0)
-        if count:
-            descriptions.append("%d %s" % (count, units[unit]))
-    return list(dict.fromkeys(descriptions))
+    source = str(text).lower()
+    colors = {"红色": "red", "蓝色": "blue", "绿色": "green", "黄色": "yellow",
+              "黑色": "black", "白色": "white", "紫色": "purple", "粉色": "pink",
+              "金色": "gold", "银色": "silver"}
+    anchors = [english for chinese, english in colors.items() if chinese in source]
+    anchors.extend(re.findall(r"\b(?:red|blue|green|yellow|black|white|purple|pink|gold|silver)\b", source))
+    subjects = {"孩子": "children", "小孩": "children", "儿童": "children", "男孩": "boys",
+                "女孩": "girls", "宝宝": "babies", "婴儿": "babies", "人物": "people",
+                "人": "people", "男性": "men", "男人": "men", "女性": "women", "女人": "women",
+                "猫": "cats", "小猫": "cats", "狗": "dogs", "小狗": "dogs", "马": "horses",
+                "树": "trees", "花": "flowers", "汽车": "cars", "轿车": "cars",
+                "车": "vehicles", "卡车": "trucks", "自行车": "bicycles", "鸟": "birds",
+                "飞机": "airplanes", "椅子": "chairs", "房子": "houses", "建筑": "buildings",
+                "角色": "characters", "演员": "actors", "学生": "students", "机器人": "robots",
+                "气球": "balloons", "星星": "stars", "桌子": "tables", "杯子": "cups",
+                "苹果": "apples", "橙子": "oranges", "手机": "phones", "电脑": "computers"}
+    chinese_count = re.compile(r"(?<!\d)(?P<count>\d{1,3}|[一二两三四五六七八九十百]{1,4})"
+                               r"\s*(?:个|只|人|位|辆|台|棵|朵|把|条|头|匹|枚|架|张|名|颗|对|组)?"
+                               r"\s*(?P<subject>" + "|".join(sorted(subjects, key=len, reverse=True)) + r")")
+    for match in chinese_count.finditer(source):
+        count = chinese_duration_number(match.group("count"))
+        if count and count.is_integer() and count <= 100:
+            anchors.append("%d %s" % (int(count), subjects[match.group("subject")]))
+    english_subjects = (r"children|kids|boys|girls|babies|people|persons|men|women|cats?|dogs?|"
+                        r"horses?|trees?|flowers?|cars?|vehicles?|trucks?|bicycles?|birds?|"
+                        r"airplanes?|chairs?|houses?|buildings?|characters?|actors?|students?|"
+                        r"robots?|balloons?|stars?|tables?|cups?|apples?|oranges?|phones?|computers?")
+    english_counts = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
+                      "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+                      "ten": 10, "eleven": 11, "twelve": 12}
+    for match in re.finditer(r"\b(?P<count>\d{1,3}|" + "|".join(english_counts) +
+                             r")\s+(?:(?:young|old|small|big|happy|white|black|red|blue|"
+                             r"green|yellow|tiny|large|little|adult|cute|beautiful)\s+){0,3}"
+                             r"(?P<subject>" + english_subjects + r")\b", source):
+        token = match.group("count")
+        count = int(token) if token.isdigit() else english_counts.get(token)
+        if count and count <= 100:
+            anchors.append("%d %s" % (count, match.group("subject")))
+    return list(dict.fromkeys(anchors))
 
 
 def visual_constraints_retained(text, anchors):
-    normalized = " " + re.sub(r"\s+", " ", str(text).lower()) + " "
-    names = {"objects": "objects?|items?|things?", "people": "persons?|people|humans?",
-             "vehicles": "vehicles?|cars?|trucks?|buses?|vans?", "units": "units?|devices?",
-             "trees": "trees?", "flowers": "flowers?", "animals": "animals?|dogs?|cats?|horses?"}
-    count_words = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six",
-                   7: "seven", 8: "eight", 9: "nine", 10: "ten"}
+    normalized = re.sub(r"\s+", " ", str(text).lower())
+    count_words = {1: "one|a|an", 2: "two", 3: "three", 4: "four", 5: "five",
+                   6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten",
+                   11: "eleven", 12: "twelve"}
+    aliases = {"children": "children|kids|child", "people": "people|persons?|humans?",
+               "men": "men|males?", "women": "women|females?", "babies": "bab(?:y|ies)|infants?",
+               "vehicles": "vehicles?|cars?|automobiles?", "cars": "cars?|automobiles?|vehicles?",
+               "airplanes": "airplanes?|planes?|aircraft", "bicycles": "bicycles?|bikes?",
+               "phones": "phones?|smartphones?", "characters": "characters?|roles?",
+               "houses": "houses?|homes?", "buildings": "buildings?|structures?"}
     for anchor in anchors:
-        parts = re.fullmatch(r"([0-9]+) ([a-z]+)", anchor)
-        if parts:
-            number, kind = parts.groups()
-            digits = r"\b(?:" + re.escape(number) + "|" + count_words.get(int(number), number) + r")\b"
-            if not re.search(digits, normalized) or not re.search(r"\b(?:" + names.get(kind, kind) + r")\b", normalized):
+        quantity = re.fullmatch(r"(\d+) ([a-z]+)", str(anchor).lower())
+        if quantity:
+            number, kind = quantity.groups()
+            count = int(number)
+            units = aliases.get(kind, re.escape(kind.rstrip("s")) + r"s?")
+            numbers = re.escape(number) + ("|" + count_words[count] if count in count_words else "")
+            pattern = (r"\b(?:" + numbers + r")\b(?:[\s,-]+[a-z]+){0,4}[\s,-]+"
+                       r"(?:" + units + r")\b")
+            if not re.search(pattern, normalized, re.I):
                 return False
-        elif not re.search(r"\b" + re.escape(anchor) + r"\b", normalized, re.I):
+        elif not re.search(r"\b" + re.escape(str(anchor)) + r"\b", normalized, re.I):
             return False
     return True
-
 
 def refine_visual_prompt(prompt, review, attempt, user_constraints=""):
     original = re.sub(r"\s+", " ", str(prompt)).strip()[:360]
@@ -2930,26 +3421,27 @@ def pdf_ocr_text(path, pages=None):
     document = pypdfium2.PdfDocument(str(path))
     count = len(document)
     targets = pages if pages is not None else range(min(count, OCR_PAGES))
-    pieces = []
+    extracted = {}
     total = 0
     try:
         for index in targets:
             if index < 0 or index >= count or total >= MAX_DOCUMENT_TEXT:
                 break
             page = document[index]
-            image = page.render(scale=OCR_PAGE_SCALE).to_pil().convert("RGB")
-            if image.width * image.height > 6 * 1024 * 1024:
-                image.thumbnail((2400, 2400))
-            answer = engine(np.asarray(image))
-            lines = [str(item).strip() for item in (getattr(answer, "txts", None) or []) if str(item).strip()]
-            text = " ".join(lines)[:MAX_DOCUMENT_TEXT - total]
-            if text:
-                pieces.append("[扫描页 %d] %s" % (index + 1, text))
-                total += len(text)
-            page.close()
+            try:
+                image = page.render(scale=OCR_PAGE_SCALE).to_pil().convert("RGB")
+                if image.width * image.height > 6 * 1024 * 1024:
+                    image.thumbnail((2400, 2400))
+                answer = engine(np.asarray(image))
+                lines = [str(item).strip() for item in (getattr(answer, "txts", None) or [])
+                         if str(item).strip()]
+                extracted[index] = " ".join(lines)[:max(0, MAX_DOCUMENT_TEXT - total)]
+                total += len(extracted[index])
+            finally:
+                page.close()
     finally:
         document.close()
-    return "\n".join(pieces)[:MAX_DOCUMENT_TEXT]
+    return extracted
 
 
 def document_text(path):
@@ -3015,22 +3507,60 @@ def document_text(path):
             indexes = (list(range(count)) if count <= sample_count else
                        sorted({round(index * (count - 1) / max(1, sample_count - 1))
                                for index in range(sample_count)}))
-            text = []
-            total = 0
+            extracted = {}
+            uncertain = []
+            scanned = []
             for index in indexes:
-                fragment = (reader.pages[index].extract_text() or "").strip()
-                fragment = fragment[:max(0, MAX_DOCUMENT_TEXT - total)]
-                if fragment:
-                    text.append("[第 %d 页] %s" % (index + 1, fragment))
-                    total += len(fragment)
+                page = reader.pages[index]
+                try:
+                    fragment = (page.extract_text() or "").strip()
+                except (RuntimeError, ValueError, TypeError, KeyError, OSError):
+                    fragment = ""
+                extracted[index] = fragment
+                try:
+                    resources = page.get("/Resources")
+                    if hasattr(resources, "get_object"):
+                        resources = resources.get_object()
+                    has_xobjects = bool(resources and hasattr(resources, "get") and
+                                        resources.get("/XObject"))
+                    has_content = bool(page.get_contents())
+                except (ValueError, TypeError, KeyError, OSError, RuntimeError):
+                    has_xobjects = True
+                    has_content = True
+                if len(re.sub(r"\s+", "", fragment)) < PDF_PAGE_TEXT_MIN_CHARS and has_content:
+                    scanned.append(index)
+                    if has_xobjects or not fragment:
+                        uncertain.append(index)
+        recognized = {}
+        ocr_error = None
+        if scanned:
+            try:
+                recognized = pdf_ocr_text(path, pages=scanned)
+            except (ImportError, ModuleNotFoundError, RuntimeError, ValueError, OSError) as error:
+                ocr_error = type(error).__name__
+        result = []
+        total = 0
+        uncertain_set = set(uncertain)
+        for index in indexes:
+            fragment = extracted.get(index, "")
+            scanned_text = str(recognized.get(index, "")).strip()
+            if scanned_text and not fragment:
+                fragment = scanned_text
+            elif scanned_text and scanned_text not in fragment:
+                fragment += " [扫描页补充] " + scanned_text
+            if index in uncertain_set and not scanned_text:
+                fragment = (fragment + "\n" if fragment else "") + (
+                    PDF_OCR_MISSING_MARKER + " %d 页：%s]" % (
+                        index + 1, "OCR 未安装" if ocr_error else "扫描内容无法辨认"))
+            if fragment:
+                entry = "[第 %d 页] %s" % (index + 1, fragment)
+                entry = entry[:max(0, MAX_DOCUMENT_TEXT - total)]
+                if entry:
+                    result.append(entry)
+                    total += len(entry)
                 if total >= MAX_DOCUMENT_TEXT:
                     break
-        if total < max(30, len(indexes) * 12):
-            try:
-                return pdf_ocr_text(path, pages=indexes)
-            except (ImportError, ModuleNotFoundError) as error:
-                raise RuntimeError("扫描 PDF 需要可选离线 OCR 组件；可在部署时尝试安装：" + str(error)[:120]) from error
-        return "\n".join(text)[:MAX_DOCUMENT_TEXT]
+        return "\n".join(result)[:MAX_DOCUMENT_TEXT]
     if extension == ".docx":
         import xml.etree.ElementTree as ET
         with zipfile.ZipFile(path) as archive:
@@ -3052,6 +3582,14 @@ def document_text_controlled(path, root, log, cancel=None):
     temporary = Path(root) / ".studio" / "tmp" / ("document_" + secrets.token_hex(12) + ".txt")
     try:
         estimated = min(600, max(90, int(path.stat().st_size / (128 * 1024)) + 90))
+        if path.suffix.lower() == ".pdf":
+            try:
+                from pypdf import PdfReader
+                with path.open("rb") as source:
+                    page_count = len(PdfReader(source, strict=False).pages)
+                estimated = max(estimated, min(1800, 90 + min(page_count, OCR_PAGES) * 18))
+            except (ImportError, OSError, ValueError, RuntimeError):
+                pass
         run_external([str(runtime_python(root)), str(Path(__file__).resolve()), "--read-document",
                       str(root), str(path), str(temporary)], root, log=log, cancel=cancel,
                      timeout=estimated, capture=True, env=shell_env(root, offline=True))
@@ -3407,6 +3945,7 @@ class LocalModels:
         self.resources = resources if resources is not None else ResourceGovernor(root)
         self.torch = importlib.import_module("torch")
         self.torch.set_num_threads(available_threads())
+        self.resources.attach_runtime(self.torch)
         try:
             self.torch.set_num_interop_threads(max(1, min(2, available_threads())))
         except RuntimeError:
@@ -3567,12 +4106,20 @@ class LocalModels:
                     raise RuntimeError("本机剩余内存不足，无法完成文案推理") from error
                 raise
 
-    def plan(self, prompt, reference, scenes, seconds):
+    def plan(self, prompt, reference, scenes, seconds, media=None):
+        media = media or media_preferences(prompt)
+        voice_rule = ("narration为自然中文旁白，需适合离线配音。" if media["narration"] else
+                      "narration仅为内部画面叙事参考，不得生成配音或解说。")
+        subtitle_rule = ("需要按narration生成字幕。" if media["subtitles"] else
+                         "不得在成品中叠加字幕、标题或额外文字。")
+        music_rule = ("保持视频全程静音。" if media["mute_all"] else
+                      "不得加入配乐。" if not media["music"] else "")
         task = ("你是专业短视频导演。请制作" + str(scenes) + "镜头。"
                 "只输出合法JSON，对象字段为"
                 '{"title":"中文标题","mood":"warm/calm/mysterious/energetic/inspiring",'
                 '"scenes":[{"narration":"自然中文旁白","visual_prompt":"详细英文画面描述","seconds":6}]}。'
-                "镜头应相互衔接，旁白每幕不重复、不编造事实。画面描述应包括可见主体、动作、景别、光线和构图。"
+                "镜头应相互衔接，不得编造事实。画面描述应包括可见主体、动作、景别、光线和构图。"
+                + voice_rule + subtitle_rule + music_rule +
                 "优先准确遵守用户的主体、人物、地点、首尾画面与限制。"
                 f"共{scenes}幕、约{seconds}秒。用户需求：{prompt[:1400]}。"
                 f"精选参考片段：{reference[:MAX_REFERENCE_BUDGET]}")
@@ -3674,7 +4221,7 @@ class LocalModels:
                     raise RuntimeError("本机剩余内存不足，无法加载图像生成模型") from error
                 raise
 
-    def paint(self, prompt, output, seed, mode, aspect="横屏 16:9"):
+    def paint(self, prompt, output, seed, mode, aspect="横屏 16:9", resource_scale=1.0):
         self.check_stop()
         self.resources.adaptive_pause("image_generation", self.stop, self.notify)
         self.resources.budget("image_generation", ram_bytes=MIN_PAINTER_USABLE_RAM,
@@ -3685,6 +4232,10 @@ class LocalModels:
         except (RuntimeError, AssertionError):
             gpu_free = 0
         resolution, steps = self.resources.image_profile(mode, self.device, gpu_free)
+        reduction = max(.55, min(1.0, float(resource_scale)))
+        if reduction < 1:
+            resolution = max(MIN_IMAGE_DIMENSION, round(resolution * reduction / 8) * 8)
+            steps = max(6, int(steps * max(.7, reduction)))
         ratio = 9 / 16 if "竖屏" in aspect else 1 if "方形" in aspect else 16 / 9
         pixels = min(MAX_IMAGE_PIXELS, resolution ** 2)
         width = max(MIN_IMAGE_DIMENSION, int(math.sqrt(pixels * ratio)) // 8 * 8)
@@ -3787,6 +4338,21 @@ class LocalModels:
             text_features = text_features / text_features.norm(dim=-1, keepdim=True).clamp_min(1e-8)
             scores = (picture_features @ text_features.T)[0].tolist()
         return assess_visual_similarity(scores)
+
+    def compare_image_continuity(self, before, after):
+        self.check_stop()
+        from PIL import Image
+        self.load_inspector()
+        with Image.open(before) as first, Image.open(after) as second:
+            pair = self.inspector_processor(images=[first.convert("RGB"), second.convert("RGB")],
+                                            return_tensors="pt")
+        with self.torch.inference_mode():
+            features = self.inspector.get_image_features(pixel_values=pair["pixel_values"])
+            features = features / features.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            similarity = float((features[0] * features[1]).sum().item())
+        return {"cosine": round(similarity, 4), "threshold": VISUAL_CONTINUITY_THRESHOLD,
+                "passed": similarity >= VISUAL_CONTINUITY_THRESHOLD,
+                "scope": "CLIP 粗略检查相邻画面风格及主体；不构成人物身份识别"}
 
     def match_asset_scores(self, scene_prompts, image_paths):
         self.check_stop()
@@ -3902,10 +4468,61 @@ class LocalModels:
         gc.collect()
 
 
+def evaluate_delivery_review_coverage(scene_count, semantic_reviews, semantic_unreviewed,
+                                      temporal_unreviewed, speech_reviews, capabilities, narration):
+    covered = {review.get("scene") for review in semantic_reviews if review.get("passed") is True}
+    missing = sorted(set(range(scene_count)) - covered)
+    conflicts = [record for record in semantic_unreviewed
+                 if record.get("status") == "user_supplied_conflict"]
+    temporal_issues = [record for record in temporal_unreviewed
+                       if record.get("status") != REVIEW_NOT_APPLICABLE]
+    recognized_speech = (not narration or bool(capabilities.get("speech_review")) and
+                         len(speech_reviews) == scene_count and
+                         all(record.get("status") == "reviewed" and all(
+                             record.get(role, {}).get("status") in {"matched", "empty_expected"}
+                             for role in ("source", "mixed")) for record in speech_reviews))
+    report = {"expected_scenes": scene_count, "semantic_reviewed_scenes": sorted(covered),
+              "semantic_unreviewed": len(semantic_unreviewed),
+              "temporal_unreviewed": len(temporal_issues),
+              "speech_checked": bool(recognized_speech),
+              "review_method": "离线 CLIP/ASR/连续帧启发式复核；不能保证人物身份、准确数量或事实真实性"}
+    if not capabilities.get("semantic_review"):
+        report.update({"delivery_allowed": False, "failure_code": "SEMANTIC_REVIEW_UNAVAILABLE",
+                       "failure": "离线语义审校组件未就绪，不能将技术检查冒充 AI 审校"})
+    elif conflicts:
+        report.update({"delivery_allowed": False, "failure_code": "SUPPLIED_SEMANTIC_CONFLICT",
+                       "scene": conflicts[0].get("scene"),
+                       "failure": "用户素材与分镜要求的 AI 语义评分冲突，需要重新匹配素材或生成画面"})
+    elif missing or semantic_unreviewed:
+        report.update({"delivery_allowed": False, "failure_code": "SCENE_SEMANTIC_UNVERIFIED",
+                       "scene": missing[0] if missing else semantic_unreviewed[0].get("scene"),
+                       "failure": "有镜头尚未获得独立 AI 语义复检通过，禁止交付"})
+    elif temporal_issues:
+        report.update({"delivery_allowed": False,
+                       "failure_code": ("TEMPORAL_REVIEW_UNAVAILABLE" if
+                                        temporal_issues[0].get("status") == REVIEW_UNAVAILABLE else
+                                        "TEMPORAL_FLICKER"),
+                       "scene": temporal_issues[0].get("scene"),
+                       "failure": "有镜头连续帧检查未通过或不可用，禁止交付"})
+    elif not recognized_speech:
+        report.update({"delivery_allowed": False, "failure_code": "SPEECH_REVIEW_UNAVAILABLE",
+                       "failure": "成片旁白没有获得逐镜头完整识别和比对，禁止交付"})
+    elif scene_count <= 0:
+        report.update({"delivery_allowed": False, "failure_code": "SCENE_SEMANTIC_UNVERIFIED",
+                       "failure": "缺少镜头审校清单，禁止交付"})
+    else:
+        report["delivery_allowed"] = True
+    report["semantic_pass"] = bool(scene_count > 0 and not missing and
+                                    not semantic_unreviewed and capabilities.get("semantic_review"))
+    return report
+
+
+
 class StudioJob:
     def __init__(self, root, request, notify, cancel, log, emit=None):
         self.root = Path(root)
         self.request = request
+        self.media = media_preferences(request.get("prompt", ""))
         self.notify = notify
         self.cancel = cancel
         self.log = log
@@ -3934,7 +4551,8 @@ class StudioJob:
                                          "system": {"memory": memory_info(), "gpu": gpu_info(),
                                                     "cpu_count": os.cpu_count()}, "events": [], "warnings": []}
         self.data.update({"status": "运行中", "result_dir": str(self.result_dir),
-                          "resumed": bool(old), "request_digest": digest})
+                          "resumed": bool(old), "request_digest": digest,
+                          "media_preferences": self.media})
         self.data.setdefault("warnings", [])
         atomic_json(self.job / "job.json", self.data)
         self.models = None
@@ -3956,18 +4574,50 @@ class StudioJob:
             self.root / ".studio" / "basic_ready.json", {}).get("diagnostic", {})
         self.voice_backend = diagnostic.get("voice_backend", "sapi")
         self.cache_signature = hashlib.sha256((model_signature(self.root) + self.voice_backend +
-                                                PIPELINE_VERSION).encode("utf-8")).hexdigest()
+                                                PIPELINE_VERSION + json.dumps(self.media, sort_keys=True)
+                                                ).encode("utf-8")).hexdigest()
         self.capabilities = require_request_capabilities(self.root, request)
         self.data["capabilities_at_start"] = self.capabilities
         self.data["review_summary"] = {"approved": 0, "user_semantic_warning": 0, "not_checked": 0}
         self.scene_extra_assets = {}
         self.motion_safe_scenes = set()
+        self.force_generated_scenes = set()
+        self.continuity_required = bool(VISUAL_CONTINUITY_PATTERN.search(self.request.get("prompt", "")))
         atomic_json(self.job / "job.json", self.data)
 
     def warn(self, message):
         if message not in self.data["warnings"]:
             self.data["warnings"].append(message)
         self.log(message)
+
+    def unused_asset_affinity(self, scenes, unused):
+        if not self.capabilities.get("semantic_review") or not unused:
+            return {}
+        previews, indexes = [], []
+        for number, (kind, path) in enumerate(unused):
+            self.models.check_stop()
+            filename = path
+            if kind == "video":
+                filename = self.job / ("unused_match_%02d_%s.png" % (
+                    number, hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:10]))
+                try:
+                    png_or_video_image(path, filename, self.root, self.log, cancel=self.cancel)
+                except (OSError, RuntimeError, TimeoutError, ValueError) as error:
+                    self.log("附加视频素材的语义预览不可用：" + str(error)[:160])
+                    continue
+            previews.append(filename)
+            indexes.append(number)
+        if not previews:
+            return {}
+        try:
+            scores = self.models.match_asset_scores([scene["visual_prompt"] for scene in scenes], previews)
+            return {index: scores[position] for position, index in enumerate(indexes)
+                    if position < len(scores) and scores[position] is not None}
+        except InterruptedError:
+            raise
+        except (OSError, RuntimeError, ValueError, MemoryError) as error:
+            self.log("附加素材语义排序不可用，回退到时长容量分配：" + str(error)[:200])
+            return {}
 
     def assign_assets(self, scenes):
         count = len(scenes)
@@ -4071,8 +4721,9 @@ class StudioJob:
                     assigned[scene_index] = alternatives[scene_index % len(alternatives)]
             self.warn("使用用户素材剪辑；扩展 AI 审校未验收时将明确标记为未审校，不冒充语义通过")
         durations = [float(scene.get("seconds", self.request["duration"] / count)) for scene in scenes]
+        affinity = self.unused_asset_affinity(scenes, unused)
         self.scene_extra_assets = distribute_unused_assets(scenes, assigned, unused, self.request,
-                                                          durations, self.fps)
+                                                          durations, self.fps, affinity=affinity)
         if unused:
             self.log("已为 %d 个额外素材分配可观看的子镜头，不会静默丢弃" % len(unused))
         self.data["assigned_assets"] = {"count": count, "request_signature": request_signature,
@@ -4158,16 +4809,22 @@ class StudioJob:
             return False
         voice = cached.get("voice")
         picture = cached["image"]
-        if (not voice or not Path(voice).is_file() or audio_seconds(voice) < .15
-                or audio_seconds(voice) > duration
-                or not picture.get("source") or not Path(picture["source"]).is_file()
-                or not cached.get("voice_signature") or not cached.get("visual_signature")
-                or file_integrity_hash(voice) != cached["voice_signature"]
-                or file_integrity_hash(picture["source"]) != cached["visual_signature"]):
+        if (not picture.get("source") or not Path(picture["source"]).is_file() or
+                not cached.get("visual_signature") or
+                file_integrity_hash(picture["source"]) != cached["visual_signature"]):
+            return False
+        if self.media["narration"]:
+            if (not isinstance(voice, str) or not Path(voice).is_file() or
+                    audio_seconds(voice) < .15 or audio_seconds(voice) > duration or
+                    not cached.get("voice_signature") or
+                    file_integrity_hash(voice) != cached["voice_signature"]):
+                return False
+        elif voice is not None or cached.get("voice_signature") is not None:
             return False
         layers = picture.get("overlays", [])
-        if (not layers or not all(isinstance(item, dict) and Path(item.get("path", "")).is_file()
-                                  and full_file_sha256(item["path"]) == item.get("sha256") for item in layers)):
+        if (not isinstance(layers, list) or bool(layers) != self.media["subtitles"] or
+                not all(isinstance(item, dict) and Path(item.get("path", "")).is_file()
+                        and full_file_sha256(item["path"]) == item.get("sha256") for item in layers)):
             return False
         try:
             return self.validate_clip(clip, duration)
@@ -4227,14 +4884,16 @@ class StudioJob:
                 content = document_text_controlled(filename, self.root, self.log, self.cancel)
                 if content:
                     records.append(("文档 %s" % Path(filename).name, content))
-                    coverage = "partial" if len(content) >= MAX_DOCUMENT_TEXT - 256 else "extracted"
+                    coverage = ("partial" if len(content) >= MAX_DOCUMENT_TEXT - 256 or
+                                PDF_OCR_MISSING_MARKER in content else "extracted")
                     pages_report = None
                     if Path(filename).suffix.lower() == ".pdf":
                         try:
                             from pypdf import PdfReader
                             with Path(filename).open("rb") as pdf_handle:
                                 pdf_pages = len(PdfReader(pdf_handle, strict=False).pages)
-                            pages_report = {"total": pdf_pages, "sampled": min(pdf_pages, OCR_PAGES)}
+                            pages_report = {"total": pdf_pages, "sampled": min(pdf_pages, OCR_PAGES),
+                                            "unreadable": len(re.findall(re.escape(PDF_OCR_MISSING_MARKER), content))}
                             if pdf_pages > OCR_PAGES:
                                 coverage = "partial"
                         except (OSError, ValueError, ImportError):
@@ -4263,10 +4922,11 @@ class StudioJob:
             atomic_json(self.job / "job.json", self.data)
             raise RuntimeError("提示词明确要求依据附件，但无法读取：" + "、".join(unreadable[:8]) +
                                "。已停止制作，避免生成没有依据的内容")
-        if incomplete and mandatory and re.search(r"全文|完整|每一页|全部细节|所有章节", self.request["prompt"]):
+        if incomplete and mandatory:
             self.data["source_analysis"] = analysis
             atomic_json(self.job / "job.json", self.data)
-            raise RuntimeError("用户要求完整依据文档，但内容超过当前安全解析容量：" + "、".join(incomplete[:8]))
+            raise RuntimeError("用户要求依据附件，但 PDF 存在未识别页面或文档超出安全读取范围：" +
+                               "、".join(incomplete[:8]) + "。请提供可复制文字或确保离线 OCR 可用")
         transcript_fields = []
         if self.request.get("audio_role") != "作为背景音乐":
             transcript_fields.append("音频")
@@ -4435,7 +5095,8 @@ class StudioJob:
             samples = []
             for number, stamp in enumerate((0.0, .7, 1.8)):
                 self.models.check_stop()
-                filename = self.job / ("asset_review_%02d_%d.png" % (index, number))
+                identity = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:12]
+                filename = self.job / ("asset_review_%02d_%s_%d.png" % (index, identity, number))
                 try:
                     run_external([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                                   "-ss", "%.3f" % stamp, "-i", str(path), "-frames:v", "1",
@@ -4585,11 +5246,13 @@ class StudioJob:
                 okay, _ = validate_image(image)
                 if okay:
                     prepared[index] = {"type": "image", "source": str(image), "review": "恢复已通过的画面",
-                                       "metrics": recorded["review"], "render_method": "generated_still_camera_motion",
+                                       "metrics": {**recorded["review"],
+                                                   **visual_review_record(True, recorded["review"])},
+                                       "render_method": "generated_still_camera_motion",
                                        "attempts": recorded.get("attempts", [])}
                     continue
             pending[index] = {"context": context, "prompt": context["scene"]["visual_prompt"],
-                              "attempts": [], "candidate": None}
+                              "attempts": [], "candidate": None, "resource_scale": 1.0}
         for attempt in range(MAX_SCENE_ATTEMPTS):
             if not pending:
                 break
@@ -4606,19 +5269,34 @@ class StudioJob:
                     consistent = (" Consistent visual style and character identity across all shots, "
                               "harmonized cinematic color palette, realistic composition. ")
                     self.models.paint(item["prompt"] + consistent, candidate, seed,
-                                      self.request["quality"], self.request["aspect"])
+                                      "快速" if item["resource_scale"] < .8 else self.request["quality"],
+                                      self.request["aspect"], resource_scale=item["resource_scale"])
                     valid, reason = validate_image(candidate)
                     if valid:
                         item["candidate"] = candidate
                     else:
-                        item["attempts"].append({"prompt": item["prompt"], "failure": reason})
+                        item["attempts"].append({"prompt": item["prompt"], "failure": reason,
+                                                 "seed": seed, "resource_scale": item["resource_scale"],
+                                                 "failure_type": "invalid_media"})
                         item["prompt"] = refine_visual_prompt(item["context"]["scene"]["visual_prompt"],
                                                               None, attempt, self.request["prompt"])
                 except InterruptedError:
                     raise
                 except (OSError, ValueError, RuntimeError, MemoryError) as error:
-                    item["attempts"].append({"prompt": item["prompt"], "error": str(error)[:500]})
-                    self.log("第 %d 幕画面生成失败：%s" % (index + 1, str(error)[:260]))
+                    memory_failure = is_memory_error(error)
+                    item["attempts"].append({"prompt": item["prompt"], "error": str(error)[:500],
+                                             "seed": seed, "resource_scale": item["resource_scale"],
+                                             "failure_type": "resource_exhausted" if memory_failure else
+                                             "generation_failed"})
+                    if memory_failure:
+                        item["resource_scale"] = max(.55, item["resource_scale"] * .77)
+                        self.models.unload_painter()
+                        gc.collect()
+                    else:
+                        item["prompt"] = refine_visual_prompt(
+                            item["context"]["scene"]["visual_prompt"], None, attempt,
+                            self.request["prompt"])
+                    self.log("第 %d 幕画面生成失败，准备定向修复：%s" % (index + 1, str(error)[:260]))
             self.models.unload_painter()
             for index, item in list(pending.items()):
                 candidate = item["candidate"]
@@ -4634,10 +5312,13 @@ class StudioJob:
                 anchors = visual_constraints(item["context"]["scene"]["visual_prompt"])
                 retained = visual_constraints_retained(item["prompt"], anchors)
                 review["constraint_text_preserved"] = retained
+                review["constraint_visual_verified"] = False
+                review["constraint_status"] = "prompt_text_only" if retained else "prompt_text_mismatch"
                 review["explicit_constraints"] = anchors[:16]
-                review["verification_limits"] = "不能仅凭 CLIP 验证准确数量、特定身份或真实动作"
+                review["verification_limits"] = "文字约束仅经提示词匹配；CLIP 无法可靠证明准确数量、特定身份或真实动作"
                 review["passed"] = bool(review["passed"] and retained)
-                item["attempts"].append({"prompt": item["prompt"], "review": review})
+                item["attempts"].append({"prompt": item["prompt"], "review": review,
+                                         "resource_scale": item["resource_scale"]})
                 self.log("第 %d 幕语义审校：相似度 %.3f、相对差值 %.3f · %s" % (
                     index + 1, review["cosine"], review["margin"],
                     "通过" if review["passed"] else "等待自动修复"))
@@ -4667,6 +5348,51 @@ class StudioJob:
                 summaries.append("第 %d 幕：%s" % (index + 1, str(item["attempts"][-1:])[:250]))
             raise RuntimeError("自动重新生成后仍有画面未通过 AI 审校：" + "；".join(summaries))
         self.models.unload_painter()
+        if self.continuity_required:
+            for index in range(1, len(contexts)):
+                before = prepared.get(index - 1)
+                after = prepared.get(index)
+                if not before or not after or before.get("type") != "image" or after.get("type") != "image":
+                    continue
+                report = self.models.compare_image_continuity(before["source"], after["source"])
+                for retry in range(MAX_SCENE_ATTEMPTS):
+                    if report["passed"]:
+                        break
+                    self.step("相邻镜头风格差异明显，自动修复第 %d 幕" % (index + 1), 60)
+                    self.models.unload_inspector()
+                    candidate = self.job / ("continuity_repair_%02d_%02d.png" % (index, retry))
+                    scene = contexts[index]["scene"]
+                    seed = int(hashlib.sha256((self.request["prompt"] + str(index) + str(retry) +
+                                                "continuity").encode("utf-8")).hexdigest()[:8], 16)
+                    revision = (scene["visual_prompt"][:400] +
+                                " The same main character, recurring costume, coherent color palette, "
+                                " matching facial and hair traits from adjacent shots, cinematic continuity.")
+                    self.models.paint(revision, candidate, seed, "快速", self.request["aspect"],
+                                      resource_scale=max(.65, .90 - retry * .08))
+                    valid, reason = validate_image(candidate)
+                    if not valid:
+                        report = {**report, "repair_failed": reason}
+                        continue
+                    semantics = self.models.image_similarity(candidate, scene["visual_prompt"])
+                    if not semantics["passed"]:
+                        report = {**report, "repair_semantic": semantics}
+                        continue
+                    report = self.models.compare_image_continuity(before["source"], candidate)
+                    if report["passed"]:
+                        shutil.copy2(candidate, after["source"])
+                        after["metrics"] = {**semantics, **visual_review_record(True, semantics),
+                                            "continuity": report}
+                        after.setdefault("attempts", []).append({"seed": seed,
+                                    "repair_type": "continuity_mismatch", "continuity": report,
+                                    "review": semantics})
+                        atomic_json(self.job / ("approved_%02d.json" % index),
+                                    {"key": contexts[index]["key"], "review": after["metrics"],
+                                     "attempts": after["attempts"], "time": now_stamp()})
+                after.setdefault("metrics", {})["continuity"] = report
+                if not report["passed"]:
+                    raise RuntimeError("第 %d 幕与相邻镜头的主体/风格连贯性未通过启发式审校，不能声称一致：%s" %
+                                       (index + 1, str(report)[:250]))
+        self.models.unload_inspector()
         return prepared
 
     def compose_clips(self, plan, force_scenes=None, repair_round=0, preserve_visual=None):
@@ -4690,6 +5416,11 @@ class StudioJob:
             length = timeline[index]
             selected = assignments.get(index)
             extras = self.scene_extra_assets.get(index, [])
+            if index in self.force_generated_scenes and not (index == 0 and self.request["files"].get("首帧")) and not (
+                    index == len(scenes) - 1 and self.request["files"].get("尾帧")):
+                selected = None
+                extras = []
+                self.log("第 %d 幕用户可选素材语义不符，改为 AI 重新生成画面" % (index + 1))
             extras_signature = hashlib.sha256(json.dumps(
                 [(kind, file_integrity_hash(path)) for kind, path in extras], ensure_ascii=False
             ).encode("utf-8")).hexdigest() if extras else ""
@@ -4705,11 +5436,14 @@ class StudioJob:
                 saved_visual = None
             if reuse:
                 self.log("第 %d 幕已通过编码检查，可直接恢复" % (index + 1))
-                track = Path(cached["voice"])
+                track = Path(cached["voice"]) if self.media["narration"] else None
             else:
-                self.step("第 %d/%d 幕 · 准备中文旁白" % (index + 1, len(scenes)),
-                          22 + int(index / len(scenes) * 15))
-                track = self.fit_speech(scene, "speech_%02d" % index, length)
+                if self.media["narration"]:
+                    self.step("第 %d/%d 幕 · 准备中文旁白" % (index + 1, len(scenes)),
+                              22 + int(index / len(scenes) * 15))
+                    track = self.fit_speech(scene, "speech_%02d" % index, length)
+                else:
+                    track = None
                 key = scene_cache_key(scene, length, self.request["aspect"], self.request["quality"],
                                       selected, self.size, self.fps, key_signature)
                 atomic_json(self.job / "storyboard.json", plan)
@@ -4735,7 +5469,7 @@ class StudioJob:
                 visual = context["cached"]["image"]
             else:
                 framefile = self.job / ("shot_%02d.png" % index)
-                title = plan["title"] if index == 0 else ""
+                title = plan["title"] if index == 0 and self.media["subtitles"] else ""
                 original_video = selected[1] if selected and selected[0] == "video" else None
                 base = selected[1] if selected and selected[0] == "image" else None
                 reused_visual = context.get("reuse_visual")
@@ -4801,25 +5535,26 @@ class StudioJob:
                         raise RuntimeError("第 %d 幕字幕合成后图片检查失败：%s" % (index + 1, reason))
                     visual["rendered"] = str(rendered)
                     clipsrc = rendered
-                overlays = self.build_caption_overlays(index, scene["narration"], length, title,
+                overlays = (self.build_caption_overlays(index, scene["narration"], length, title,
                     boundary_first=boundary_image and index == 0,
                     boundary_last=boundary_image and index == len(scenes) - 1)
+                    if self.media["subtitles"] else [])
                 visual["overlays"] = overlays
                 visual["caption_mask"] = overlays[0]["path"] if overlays else None
                 montage = self.encode_scene_montage(
                     clip, clipsrc, original_video, length, overlays, index, len(scenes), selected,
                     context.get("extras", []),
                     native_seconds=visual.get("source_seconds") if visual.get("type") == "native_video" else None,
-                    boundary_image=boundary_image)
+                    boundary_image=boundary_image, primary_review=visual.get("metrics", {}))
                 if montage:
                     visual["montage"] = montage
                 atomic_json(context["checkpoint"], {"passed": True, "duration": length,
                             "key": context["key"], "voice": str(track), "image": visual,
-                            "voice_signature": file_integrity_hash(track),
+                            "voice_signature": file_integrity_hash(track) if track else None,
                             "visual_signature": file_integrity_hash(visual["source"]),
                             "clip": str(clip), "time": now_stamp()})
             clips.append(clip)
-            wavs.append(str(track))
+            wavs.append(str(track) if track else None)
             images.append(visual)
             montage = visual.get("montage", [])
             original_videos.append(montage if montage else
@@ -4833,36 +5568,66 @@ class StudioJob:
                                review=visual.get("review", "检查已完成") + " · " + status)
             self.step("第 %d/%d 幕已完成，可断点恢复" % (index + 1, len(scenes)),
                       60 + int((index + 1) / len(scenes) * 20))
-        voice = self.job / "voice.wav"
-        join_voice_audio(wavs, timeline, voice)
+        voice = self.job / "voice.wav" if self.media["narration"] else None
+        if voice is not None:
+            join_voice_audio(wavs, timeline, voice)
         self.write_subtitle_timeline(scenes, timeline, wavs)
         self.original_videos = original_videos
         return clips, voice, sum(timeline), images
 
     def encode_scene_montage(self, clip, clipsrc, original_video, seconds, overlays, index,
-                             scene_count, primary, extras, native_seconds=None, boundary_image=False):
+                             scene_count, primary, extras, native_seconds=None, boundary_image=False,
+                             primary_review=None):
         effective_primary = primary or ("video" if original_video else "image", str(original_video or clipsrc))
         sequence = asset_sequence_for_scene(effective_primary, extras, index, scene_count, self.request)
-        if len(sequence) <= 1:
+        accepted = []
+        evaluations = {}
+        required_all = bool(re.search(
+            r"(?:必须|务必|一定要|需要)(?:使用|保留|采用).{0,18}(?:所有|全部)(?:素材|图片|视频)|"
+            r"(?:全部|所有)(?:素材|图片|视频).{0,18}(?:必须|务必|都要|都得|使用|保留|采用)|"
+            r"(?:必须|务必).{0,12}(?:所有|全部)(?:素材|图片|视频)",
+            self.request.get("prompt", "")))
+        for slot, (kind, path) in enumerate(sequence):
+            is_primary = bool(kind == effective_primary[0] and str(path) == str(effective_primary[1]))
+            if is_primary:
+                evaluations[slot] = primary_review if isinstance(primary_review, dict) else {}
+                accepted.append((kind, path, slot, True))
+                continue
+            evaluation = self.review_supplied_visual(path, self.active_plan["scenes"][index], index, kind)
+            if not evaluation.get("technical_passed"):
+                raise RuntimeError("第 %d 幕额外素材无法正常解码：%s" % (index + 1, Path(path).name))
+            if evaluation.get("semantic_passed") is not True:
+                if required_all:
+                    raise RuntimeError("用户要求必须使用全部素材，但第 %d 幕素材 %s 与分镜语义不符，不能冒充审校通过" % (
+                        index + 1, Path(path).name))
+                self.warn("第 %d 幕附加素材 %s 与分镜语义不符，已自动保留原文件但不加入成片" % (
+                    index + 1, Path(path).name))
+                self.data.setdefault("excluded_optional_assets", []).append({
+                    "scene": index, "kind": kind, "source": str(path),
+                    "reason": "semantic_review_failed", "review": evaluation})
+                continue
+            evaluations[slot] = evaluation
+            accepted.append((kind, path, slot, False))
+        if not accepted or sum(bool(primary) for _, _, _, primary in accepted) != 1:
+            raise RuntimeError("场景素材顺序不完整，无法可靠合成视频")
+        if len(accepted) <= 1:
             self.encode_clip(clip, clipsrc, original_video, seconds, overlays,
                              first=index == 0, last=index == scene_count - 1,
                              native_seconds=native_seconds,
                              boundary_hold=boundary_image or index in self.motion_safe_scenes)
-            return [{"kind": effective_primary[0], "source": str(effective_primary[1]),
-                     "seconds": seconds, "primary": True}]
-        durations = montage_frame_allocation(seconds, sequence, self.fps)
+            kind, source, slot, _ = accepted[0]
+            return [{"kind": kind, "source": str(source), "seconds": seconds,
+                     "start": 0.0, "end": float(seconds), "slot": 0, "primary": True,
+                     "review": evaluations[slot]}]
+        durations = montage_frame_allocation(seconds, accepted, self.fps)
         parts = []
         records = []
-        for slot, ((kind, path), length) in enumerate(zip(sequence, durations)):
-            is_primary = bool(kind == effective_primary[0] and path == effective_primary[1])
+        cursor = 0.0
+        for slot, ((kind, path, original_slot, is_primary), length) in enumerate(zip(accepted, durations)):
             actual_source = (original_video or clipsrc) if is_primary else str(path)
             video = actual_source if (kind == "video" or is_primary and original_video) else None
             if is_primary and not video:
                 actual_source = clipsrc
-            if not is_primary:
-                evaluation = self.review_supplied_visual(path, self.active_plan["scenes"][index], index, kind)
-                if not evaluation.get("technical_passed"):
-                    raise RuntimeError("额外素材无法解码：" + Path(path).name)
             part_file = self.job / ("scene_%02d_visual_%02d.mp4" % (index, slot))
             self.encode_clip(part_file, actual_source, video, length, first=True, last=True,
                              native_seconds=native_seconds if is_primary and video and
@@ -4870,13 +5635,15 @@ class StudioJob:
                              boundary_hold=(boundary_image and is_primary or index in self.motion_safe_scenes))
             parts.append(part_file)
             records.append({"kind": kind, "source": str(path), "seconds": length,
-                            "segment": str(part_file), "primary": is_primary})
+                            "start": round(cursor, 6), "end": round(cursor + length, 6),
+                            "slot": slot, "segment": str(part_file), "primary": is_primary,
+                            "review": evaluations.get(original_slot, {})})
+            cursor += length
         assembled = self.job / ("scene_%02d_montage.mp4" % index)
         self.concat_clips(parts, assembled)
         self.encode_clip(clip, assembled, assembled, seconds, overlays,
                          first=index == 0, last=index == scene_count - 1)
         return records
-
 
     def build_caption_overlays(self, index, text, seconds, title="", boundary_first=False, boundary_last=False):
         segments = paginate_caption(text, self.size, seconds, self.fps)
@@ -4901,13 +5668,21 @@ class StudioJob:
         for index, (scene, duration) in enumerate(zip(scenes, durations)):
             info = read_json(self.job / ("scene_%02d.json" % index), {})
             segments = info.get("image", {}).get("overlays", [])
-            if not segments or normalized_caption("".join(part["text"] for part in segments)) != normalized_caption(scene["narration"]):
-                raise RuntimeError("第 %d 幕没有完整的分段字幕记录" % (index + 1))
+            text = scene["narration"] if self.media["subtitles"] else ""
+            if (not isinstance(segments, list) or bool(segments) != self.media["subtitles"] or
+                    normalized_caption("".join(str(part.get("text", "")) for part in segments)) !=
+                    normalized_caption(text)):
+                raise RuntimeError("第 %d 幕的字幕记录与用户的字幕要求不一致" % (index + 1))
+            wav = wavs[index]
+            if self.media["narration"] and (not wav or not Path(wav).is_file()):
+                raise RuntimeError("第 %d 幕缺少请求的旁白文件" % (index + 1))
+            if not self.media["narration"] and wav is not None:
+                raise RuntimeError("第 %d 幕包含用户明确禁止的旁白" % (index + 1))
             subtitles.append({"index": index, "from": round(cursor, 5),
-                              "to": round(cursor + duration, 5), "caption": scene["narration"],
-                              "segments": segments, "voice_file": str(wavs[index]),
-                              "voice_sha256": file_integrity_hash(wavs[index]),
-                              "voice_seconds": round(audio_seconds(wavs[index]), 3)})
+                              "to": round(cursor + duration, 5), "caption": text,
+                              "segments": segments, "voice_file": str(wav) if wav else None,
+                              "voice_sha256": file_integrity_hash(wav) if wav else None,
+                              "voice_seconds": round(audio_seconds(wav), 3) if wav else 0.0})
             cursor += duration
         atomic_json(self.job / "subtitle_timeline.json", subtitles)
         return subtitles
@@ -4988,7 +5763,8 @@ class StudioJob:
 
     def build_original_audio(self, durations):
         videos = getattr(self, "original_videos", [])
-        if (self.request.get("source_audio_role", "自动混合原声") == "静音原声"
+        if (not self.media["source_audio"] or
+                self.request.get("source_audio_role", "自动混合原声") == "静音原声"
                 or not any(any(item.get("kind") == "video" for item in group)
                            if isinstance(group, list) else bool(group) for group in videos)):
             return None
@@ -5075,41 +5851,65 @@ class StudioJob:
 
     def combine_audio(self, mute_video, voice, seconds, mood, seed, result,
                       voice_gain=1.1, background_gain=.17, ambient_gain=None):
-        if wav_rms(voice) < .0007:
-            raise RuntimeError("合成旁白接近静音，禁止交付无声视频")
-        mus = self.job / "music.wav"
-        supplied = self.request["files"].get("音频", [])
-        if supplied and self.request.get("audio_role") == "作为背景音乐":
-            source = self.background_audio_playlist(supplied)
-            self.log("使用用户提供的背景音乐：" + str(source))
-        else:
-            generate_music(mus, seconds, mood, seed)
-            source = mus
-        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(mute_video),
-                "-i", str(voice), "-stream_loop", "-1", "-i", str(source)]
-        ambient = getattr(self, "ambient_audio", None)
+        if self.media["narration"] and (not voice or wav_rms(voice) < .0007):
+            raise RuntimeError("用户要求的中文旁白接近静音，不能作为已完成的配音交付")
+        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(mute_video)]
+        components = []
+        if self.media["narration"]:
+            position = len(components) + 1
+            args.extend(["-i", str(voice)])
+            components.append((position, "voice", voice_gain))
+        if self.media["music"]:
+            mus = self.job / "music.wav"
+            supplied = self.request["files"].get("音频", [])
+            if supplied and self.request.get("audio_role") == "作为背景音乐":
+                source = self.background_audio_playlist(supplied)
+                self.log("使用用户提供的背景音乐：" + str(source))
+            else:
+                generate_music(mus, seconds, mood, seed)
+                source = mus
+            position = len(components) + 1
+            args.extend(["-stream_loop", "-1", "-i", str(source)])
+            priority = self.request.get("source_audio_role") == "原声优先"
+            components.append((position, "music", min(background_gain, .10) if priority else background_gain))
+        ambient = getattr(self, "ambient_audio", None) if self.media["source_audio"] else None
         if ambient and Path(ambient).is_file():
+            position = len(components) + 1
             args.extend(["-i", str(ambient)])
             priority = self.request.get("source_audio_role") == "原声优先"
-            mix = ("[1:a]volume=%.3f,asplit=3[voice][key][voicekey];"
-                   "[2:a]volume=%.3f[bg];"
-                   "[bg][key]sidechaincompress=threshold=0.025:ratio=6:attack=30:release=280[duck];"
-                   "[3:a]volume=%.3f[amb];"
-                   "[amb][voicekey]sidechaincompress=threshold=0.028:ratio=5:attack=25:release=280[ambduck];"
-                   "[voice][duck][ambduck]amix=inputs=3:duration=first:dropout_transition=0:normalize=0,"
-                   "alimiter=limit=0.95[mix]") % (voice_gain, min(background_gain, .10) if priority
-                                                   else background_gain,
-                                                   .65 if priority and ambient_gain is None else
-                                                   AMBIENT_VOLUME if ambient_gain is None else ambient_gain)
+            gain = (.65 if priority else AMBIENT_VOLUME) if ambient_gain is None else ambient_gain
+            components.append((position, "ambient", gain))
+        args.extend(["-map", "0:v:0"])
+        if components:
+            filters = []
+            for position, name, gain in components:
+                filters.append("[%d:a]aresample=%d,volume=%.4f[a_%s]" % (
+                    position, SPEECH_RATE, gain, name))
+            names = {name for _, name, _ in components}
+            duck_targets = [name for name in ("music", "ambient") if name in names and "voice" in names]
+            if duck_targets:
+                filters.append("[a_voice]asplit=%d[voice_main]%s" % (
+                    len(duck_targets) + 1, "".join("[voice_key_%s]" % name for name in duck_targets)))
+            labels = ["[voice_main]" if duck_targets else "[a_voice]"] if "voice" in names else []
+            for name in ("music", "ambient"):
+                if name not in names:
+                    continue
+                if name in duck_targets:
+                    filters.append("[a_%s][voice_key_%s]sidechaincompress="
+                                   "threshold=0.025:ratio=6:attack=30:release=280[duck_%s]" % (
+                                       name, name, name))
+                    labels.append("[duck_%s]" % name)
+                else:
+                    labels.append("[a_%s]" % name)
+            if len(labels) == 1:
+                filters.append(labels[0] + "alimiter=limit=0.95[mix]")
+            else:
+                filters.append("".join(labels) + "amix=inputs=%d:duration=longest:dropout_transition=0:normalize=0,"
+                               "alimiter=limit=0.95[mix]" % len(labels))
+            args.extend(["-filter_complex", ";".join(filters), "-map", "[mix]", "-c:a", "aac", "-b:a", "160k"])
         else:
-            mix = ("[1:a]volume=%.3f,asplit=2[voice][key];"
-                   "[2:a]volume=%.3f[bg];"
-                   "[bg][key]sidechaincompress=threshold=0.025:ratio=6:attack=30:release=280[duck];"
-                   "[voice][duck]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
-                   "alimiter=limit=0.95[mix]") % (voice_gain, background_gain)
-        args.extend(["-filter_complex", mix, "-map", "0:v:0", "-map", "[mix]", "-c:v", "copy",
-                     "-c:a", "aac", "-b:a", "160k", "-t", "%.3f" % seconds,
-                     "-movflags", "+faststart", str(result)])
+            args.append("-an")
+        args.extend(["-c:v", "copy", "-t", "%.3f" % seconds, "-movflags", "+faststart", str(result)])
         run_external(args, self.root, log=self.log, cancel=self.cancel, timeout=300, capture=True)
         return result
 
@@ -5228,18 +6028,24 @@ class StudioJob:
         return report
 
     def check_final(self, path, seconds, scene_durations=None):
-        result = {"passed": False, "file": str(path), "expected_seconds": round(seconds, 3),
-                  "checked": datetime.datetime.now().isoformat()}
+        result = {"passed": False, "technical_pass": False, "semantic_pass": False,
+                  "delivery_allowed": False, "file": str(path),
+                  "expected_seconds": round(seconds, 3),
+                  "checked": datetime.datetime.now().isoformat(), "media_preferences": self.media}
         if not Path(path).is_file() or Path(path).stat().st_size < 8192:
             result["failure_code"] = "OUTPUT_MISSING"
             result["failure"] = "成片不存在或大小异常"
             return result
         self.log("检查成片全部音视频流、时长及抽样画面")
         try:
-            output = run_external([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-xerror",
-                                   "-i", str(path), "-map", "0:v:0", "-map", "0:a:0",
-                                   "-progress", "pipe:1", "-f", "null", "-"],
-                                  self.root, cancel=self.cancel, timeout=max(240, int(seconds * 18)), capture=True)
+            audio_expected = bool(self.media["narration"] or self.media["music"] or
+                                  (self.media["source_audio"] and getattr(self, "ambient_audio", None)))
+            decode_args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-xerror",
+                           "-i", str(path), "-map", "0:v:0"]
+            decode_args.extend(["-map", "0:a:0"] if audio_expected else ["-an"])
+            decode_args.extend(["-progress", "pipe:1", "-f", "null", "-"])
+            output = run_external(decode_args, self.root, cancel=self.cancel,
+                                  timeout=max(240, int(seconds * 18)), capture=True)
         except (RuntimeError, TimeoutError, OSError) as error:
             result["failure_code"] = "DECODE_FAILURE"
             result["failure"] = "音视频流缺失或解码失败：" + str(error)[:500]
@@ -5287,6 +6093,24 @@ class StudioJob:
         if self.request["files"].get("尾帧"):
             endpoints[round(max(0.0, min(actual_seconds, seconds) - 2 / self.fps), 3)] = (
                 len(scene_durations) - 1 if scene_durations else None)
+        caption_probe_positions = set(probes)
+        montage_segments = {}
+        if scene_durations:
+            scene_start = 0.0
+            for scene_index, duration in enumerate(scene_durations):
+                saved = read_json(self.job / ("scene_%02d.json" % scene_index), {}).get("image", {})
+                parts = saved.get("montage", []) if isinstance(saved, dict) else []
+                if isinstance(parts, list) and parts:
+                    montage_segments[scene_index] = parts
+                    elapsed = 0.0
+                    for part in parts:
+                        length = max(0.0, float(part.get("seconds", 0)))
+                        if length >= 2 / self.fps:
+                            middle = round(scene_start + elapsed + length * 0.5, 3)
+                            if scene_start <= middle < scene_start + duration:
+                                probes[middle] = scene_index
+                        elapsed += length
+                scene_start += duration
         probes.update(endpoints)
         positions = sorted(probes)
         semantic_reviews = []
@@ -5327,7 +6151,8 @@ class StudioJob:
                             break
                 return result
             scene_index = probes[position]
-            if scene_index is not None and position not in endpoints:
+            if (scene_index is not None and position not in endpoints and
+                    position in caption_probe_positions and self.media["subtitles"]):
                 saved_visual = read_json(self.job / ("scene_%02d.json" % scene_index), {}).get("image", {})
                 local_position = position - sum(scene_durations[:scene_index]) if scene_durations else 0
                 segments = saved_visual.get("overlays", [])
@@ -5352,7 +6177,17 @@ class StudioJob:
             if (scene_index is not None and position not in endpoints
                     and hasattr(self, "active_plan") and scene_index < len(self.active_plan["scenes"])):
                 saved = read_json(self.job / ("scene_%02d.json" % scene_index), {})
-                baseline = saved.get("image", {}).get("metrics")
+                base_visual = saved.get("image", {})
+                baseline = base_visual.get("metrics") if isinstance(base_visual, dict) else None
+                selected_segment = None
+                cursor = sum(scene_durations[:scene_index]) if scene_durations else 0.0
+                local_time = max(0.0, position - cursor)
+                for part in montage_segments.get(scene_index, []):
+                    if float(part.get("start", -1)) - 1 / self.fps <= local_time < float(part.get("end", -1)) + 1 / (self.fps * 4):
+                        selected_segment = part
+                        if isinstance(part.get("review"), dict):
+                            baseline = part["review"]
+                        break
                 if not isinstance(baseline, dict) or baseline.get("semantic_passed") is None:
                     semantic_unreviewed.append({"scene": scene_index,
                                                 "status": "not_checked",
@@ -5379,6 +6214,9 @@ class StudioJob:
                                 semantics["margin"] >= minimum_margin and
                                 semantics["subject_margin"] >= MIN_CLIP_ABSOLUTE_MARGIN)
                     semantic_reviews.append({"scene": scene_index, "position": position,
+                                             "source_slot": selected_segment.get("slot") if selected_segment else 0,
+                                             "source_kind": selected_segment.get("kind") if selected_segment else
+                                             base_visual.get("type", "unknown"),
                                              "original_cosine": original,
                                              "final": semantics, "required_cosine": round(retention, 4),
                                              "required_margin": round(minimum_margin, 4), "passed": accepted})
@@ -5415,24 +6253,38 @@ class StudioJob:
         result["temporal_unreviewed"] = temporal_unreviewed
         preview = self.job / "final_preview.png"
         shutil.copy2(self.job / ("final_check_%02d.png" % (len(positions) // 2)), preview)
-        try:
-            audio_scan = run_external([self.ffmpeg, "-hide_banner", "-nostdin", "-i", str(path),
-                                       "-vn", "-af", "volumedetect", "-f", "null", "-"],
-                                      self.root, cancel=self.cancel, timeout=max(120, int(seconds * 5)), capture=True)
-            found = re.search(r"mean_volume:\s*(-?inf|-?[\d.]+)\s*dB", audio_scan)
-            if not found or found.group(1) == "-inf" or float(found.group(1)) < -65:
-                result["failure_code"] = "AUDIO_LOW"
-                result["failure"] = "成片声轨检测为静音或过低，拒绝交付"
+        if audio_expected:
+            try:
+                audio_scan = run_external([self.ffmpeg, "-hide_banner", "-nostdin", "-i", str(path),
+                                           "-vn", "-af", "volumedetect", "-f", "null", "-"],
+                                          self.root, cancel=self.cancel,
+                                          timeout=max(120, int(seconds * 5)), capture=True)
+                found = re.search(r"mean_volume:\s*(-?inf|-?[\d.]+)\s*dB", audio_scan)
+                if not found or found.group(1) == "-inf" or float(found.group(1)) < -65:
+                    result["failure_code"] = "AUDIO_LOW"
+                    result["failure"] = "按用户要求保留的声轨静音或音量过低，拒绝交付"
+                    return result
+                result["mean_volume_db"] = float(found.group(1))
+            except (RuntimeError, TimeoutError, OSError, ValueError) as error:
+                result["failure_code"] = "AUDIO_SCAN_FAILED"
+                result["failure"] = "成片声音检查失败：" + str(error)[:350]
                 return result
-            result["mean_volume_db"] = float(found.group(1))
-        except (RuntimeError, TimeoutError, OSError, ValueError) as error:
-            result["failure_code"] = "AUDIO_SCAN_FAILED"
-            result["failure"] = "成片声音检查失败：" + str(error)[:350]
-            return result
+        else:
+            try:
+                run_external([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+                              "-i", str(path), "-map", "0:a:0", "-t", "0.1", "-f", "null", "-"],
+                             self.root, cancel=self.cancel, timeout=40, capture=True)
+                result.update({"failure_code": "UNWANTED_AUDIO", "failure": "用户要求静音，但成片仍包含音轨"})
+                return result
+            except RuntimeError:
+                result["audio_policy_verified"] = "no_audio_stream"
+            except (TimeoutError, OSError) as error:
+                result.update({"failure_code": "AUDIO_SCAN_FAILED", "failure": str(error)[:350]})
+                return result
         if scene_durations:
             if not isinstance(captions, list) or len(captions) != len(scene_durations):
                 result.update({"failure_code": "CAPTION_TIMELINE_MISSING",
-                               "failure": "字幕时间线记录缺失或镜头数量不匹配"})
+                               "failure": "字幕与旁白时间线记录缺失或镜头数量不匹配"})
                 return result
             cursor = 0.0
             caption_checks = []
@@ -5441,47 +6293,53 @@ class StudioJob:
                 valid = isinstance(caption, dict) and isinstance(caption.get("segments"), list)
                 parts = caption.get("segments", []) if valid else []
                 if valid:
-                    valid = bool(parts) and all(isinstance(part, dict) for part in parts)
+                    valid = bool(parts) == self.media["subtitles"] and all(isinstance(part, dict) for part in parts)
                 if valid:
                     try:
+                        requested_caption = scene.get("narration", "") if self.media["subtitles"] else ""
                         reconstructed = normalized_caption("".join(str(part.get("text", "")) for part in parts))
                         voice = caption.get("voice_file")
                         voice_seconds = float(caption.get("voice_seconds", -1))
-                        valid = (caption.get("caption") == scene.get("narration") and
+                        if self.media["narration"]:
+                            voice_valid = (isinstance(voice, str) and Path(voice).is_file() and
+                                           0 < voice_seconds <= duration + .05 and math.isfinite(voice_seconds) and
+                                           file_integrity_hash(voice) == caption.get("voice_sha256"))
+                        else:
+                            voice_valid = (voice is None and caption.get("voice_sha256") is None and
+                                           voice_seconds == 0.0)
+                        valid = (caption.get("caption") == requested_caption and
                                  abs(float(caption.get("from", -1)) - cursor) <= 2 / self.fps and
                                  abs(float(caption.get("to", -1)) - cursor - duration) <= 2 / self.fps and
-                                 0 < voice_seconds <= duration + .05 and math.isfinite(voice_seconds) and
-                                 isinstance(voice, str) and Path(voice).is_file() and
-                                 file_integrity_hash(voice) == caption.get("voice_sha256") and
-                                 reconstructed == normalized_caption(scene.get("narration", "")))
+                                 voice_valid and reconstructed == normalized_caption(requested_caption))
                         prior_end = 0.0
                         for part in parts:
                             filename = part.get("path")
                             start = float(part.get("start", -1))
-                            end = float(part.get("end", -1))
+                            finish = float(part.get("end", -1))
                             if (not isinstance(filename, str) or not Path(filename).is_file() or
-                                    not all(math.isfinite(value) for value in (start, end)) or
-                                    not 0 <= start < end <= duration + 1 / self.fps or
+                                    not all(math.isfinite(value) for value in (start, finish)) or
+                                    not 0 <= start < finish <= duration + 1 / self.fps or
                                     start + 1 / self.fps < prior_end or
                                     full_file_sha256(filename) != part.get("sha256")):
                                 valid = False
                                 break
-                            prior_end = end
+                            prior_end = finish
                     except (OSError, TypeError, ValueError, OverflowError):
                         valid = False
                 if not valid:
                     result.update({"failure_code": "CAPTION_TIMELINE_MISMATCH", "scene": index,
-                                   "failure": "字幕分页文字、可见时段、校验和或对应旁白与分镜不一致"})
+                                   "failure": "第 %d 幕字幕/旁白清单违反文本、时间轴或静音要求" % (index + 1)})
                     return result
-                caption_checks.append({"scene": index, "pages": len(parts), "voice_verified": True,
-                                       "full_text_covered": True})
+                caption_checks.append({"scene": index, "pages": len(parts),
+                                       "voice_verified": self.media["narration"],
+                                       "full_text_covered": self.media["subtitles"]})
                 cursor += duration
             result["caption_manifest_verified"] = True
             result["caption_checks"] = caption_checks
         result["frames_checked"] = positions
         result["semantic_reviews"] = semantic_reviews
         result["semantic_unreviewed"] = semantic_unreviewed
-        if scene_durations and self.capabilities["speech_review"]:
+        if scene_durations and self.media["narration"] and self.capabilities["speech_review"]:
             speech_reviews = self.review_spoken_narration(path, scene_durations)
             result["speech_reviews"] = speech_reviews
             for review in speech_reviews:
@@ -5491,32 +6349,36 @@ class StudioJob:
                                    "failure": "第 %d 幕成片真实音轨与原旁白不符或声音不可辨认：%s" %
                                    (review["scene"] + 1, issue)})
                     return result
+        elif not self.media["narration"]:
+            result["speech_reviews"] = [{"status": "not_applicable", "reason": "用户明确要求无旁白"}]
         else:
             result["speech_reviews"] = [{"status": "not_checked", "reason": "语音识别模型未验收"}]
-        if not scene_durations:
-            result["review_level"] = "technical_only"
-        elif semantic_unreviewed or temporal_unreviewed:
-            result["review_level"] = "partially_reviewed"
-        elif not self.capabilities.get("semantic_review") or not self.capabilities.get("speech_review"):
-            result["review_level"] = "partially_reviewed"
-        elif any(review.get("status") != "reviewed" or any(
-                review.get(role, {}).get("status") not in {"matched", "empty_expected"}
-                for role in ("source", "mixed")) for review in result.get("speech_reviews", [])):
-            result["review_level"] = "partially_reviewed"
-        else:
-            result["review_level"] = "multimodal_heuristic_reviewed"
+        report = evaluate_delivery_review_coverage(
+            len(scene_durations or []), semantic_reviews, semantic_unreviewed,
+            temporal_unreviewed, result.get("speech_reviews", []), self.capabilities,
+            self.media["narration"])
+        result["review_coverage"] = report
+        result["technical_pass"] = True
+        result["semantic_pass"] = report["semantic_pass"]
+        result["delivery_allowed"] = report["delivery_allowed"]
+        result["review_level"] = ("multimodal_heuristic_reviewed" if report["delivery_allowed"] else
+                                  "partially_reviewed" if scene_durations else "technical_only")
         result["checks"] = {"decode": True, "duration": True, "sampled_frames": True,
                             "temporal_neighbors": sum(review.get("status") == REVIEW_PASS
                                                       for review in temporal_reviews),
                             "temporal_unreviewed": len(temporal_unreviewed),
-                            "audio_presence": True,
-                            "subtitle_timeline": bool(scene_durations), "caption_visibility": True,
+                            "audio_presence": audio_expected,
+                            "subtitle_timeline": bool(scene_durations and self.media["subtitles"]),
+                            "caption_visibility": self.media["subtitles"],
                             "content_semantics": "CLIP 启发式复检及显式文字约束审查；身份、数量、真实动作和事实无法被此模型可靠证明",
                             "subtitle_text": "字幕原文、时间轴及遮罩文件已检查；未声称 OCR 逐字验证",
-                            "speech_synchronization": "成片实际 AAC 音轨逐幕提取，配合源音轨 ASR 与波形相关性复检"}
+                            "speech_synchronization": ("成片实际 AAC 音轨逐幕提取，配合源音轨 ASR 与波形相关性复检"
+                                                       if self.media["narration"] else "无旁白，语音核验不适用")}
         result["limitations"] = ["CLIP 不能严格验证精确数量、人物身份、历史事实和动作完成度",
-                                 "已执行生成提示词约束保留检查及成片多关键帧抽查"]
-        result["passed"] = True
+                                 "已执行生成提示词约束保留检查及每段素材中点的成片复检"]
+        result["passed"] = bool(result["technical_pass"] and result["delivery_allowed"])
+        if not result["passed"]:
+            result.update({key: report[key] for key in ("failure_code", "failure", "scene") if key in report})
         return result
 
     def start(self):
@@ -5565,12 +6427,12 @@ class StudioJob:
                 self.models.listener_processor = None
                 gc.collect()
                 self.step("AI 编写文案、分镜与配乐风格", 12)
-                plan = self.models.plan(self.request["prompt"], reference, scenes, seconds)
+                plan = self.models.plan(self.request["prompt"], reference, scenes, seconds, self.media)
                 atomic_json(self.job / "storyboard.json", plan)
             timeline = semantic_timeline(seconds, plan["scenes"], self.fps)
             for index, scene in enumerate(plan["scenes"]):
                 scene["seconds"] = timeline[index]
-                if narration_units(scene["narration"]) > timeline[index] * 3.2:
+                if (self.media["narration"] or self.media["subtitles"]) and narration_units(scene["narration"]) > timeline[index] * 3.2:
                     scene["narration"] = self.rewrite_narration(scene["narration"], timeline[index])
             atomic_json(self.job / "storyboard.json", plan)
             self.models.unload_director()
@@ -5635,6 +6497,19 @@ class StudioJob:
                                        background_gain=.06 if attempt == 0 else .015,
                                        ambient_gain=.05 if attempt == 0 else 0)
                 elif "scene" in verdict:
+                    if action == "replace_optional_supplied_visual":
+                        if ((verdict["scene"] == 0 and self.request["files"].get("首帧")) or
+                                (verdict["scene"] == len(plan["scenes"]) - 1 and
+                                 self.request["files"].get("尾帧")) or
+                                re.search(r"必须使用|必须保留|只能使用|严格使用|use only the supplied|must use the supplied",
+                                          self.request["prompt"], re.I)):
+                            atomic_json(self.job / "final_reviews.json", reviews)
+                            self.data["final_review"] = verdict
+                            atomic_json(self.job / "job.json", self.data)
+                            raise RuntimeError("用户明确指定的素材与分镜语义冲突，无法擅自替换；请检查原始要求与素材")
+                        self.force_generated_scenes.add(verdict["scene"])
+                        self.warn("第 %d 幕参考素材与需求冲突，尝试重新生成而不修改原文件" %
+                                  (verdict["scene"] + 1))
                     preserve = ({verdict["scene"]} if action in {
                         "reencode_caption_keep_visual", "disable_synthetic_motion_keep_visual"} else set())
                     if action == "disable_synthetic_motion_keep_visual":
@@ -5671,6 +6546,8 @@ class StudioJob:
                 if verdict["passed"]:
                     temp_output = modified
             atomic_json(self.job / "final_reviews.json", reviews)
+            self.data["final_review"] = verdict
+            atomic_json(self.job / "job.json", self.data)
             if not verdict["passed"]:
                 raise RuntimeError("成片复检仍未通过：%s。可点击黑匣子导出诊断" % verdict.get("failure", "未知原因"))
             tmp_output = output.with_name(output.name + "." + secrets.token_hex(5) + ".partial.mp4")
@@ -5686,7 +6563,11 @@ class StudioJob:
             screenshot = self.job / "final_preview.png"
             if screenshot.exists():
                 shutil.copy2(screenshot, self.result_dir / "cover.png")
+            strategy_counts = {method: sum(item.get("render_method") == method for item in assets)
+                               for method in ("cogvideox_generated_motion", "supplied_video_edit",
+                                              "generated_still_camera_motion", "supplied_still_camera_motion")}
             self.data.update({"status": "完成", "finished": datetime.datetime.now().isoformat(),
+                              "render_strategy_counts": strategy_counts,
                               "render_modes": [item.get("type", "unknown") for item in assets],
                               "render_methods": [item.get("render_method", "unknown") for item in assets],
                               "render_method_note": "真实动态视频只指 CogVideoX 生成镜头；图片动态运镜仅为平移缩放剪辑",
@@ -5699,9 +6580,7 @@ class StudioJob:
             atomic_json(self.job / "job.json", self.data)
             atomic_json(self.result_dir / "manifest.json", self.data)
             self.publish_event("phase", phase="complete")
-            completion = ("成片已保存，技术检查通过；部分素材未完成 AI 语义审校，请查看交付报告"
-                          if verdict.get("review_level") != "multimodal_heuristic_reviewed" else
-                          "成片已保存，多模态启发式复检通过；请查看交付报告")
+            completion = "成片已保存，多模态启发式复检通过；请查看交付报告"
             self.step(completion, 100)
             return output
         except Exception as error:
@@ -5801,12 +6680,12 @@ def system_report(root, request=None):
         "python_executable": sys.executable, "locale": locale.getlocale(), "cwd": str(Path.cwd()),
         "workspace": str(root), "disk": {"total": drive.total, "used": drive.used, "free": drive.free},
         "memory": memory_info(), "gpu": gpu_info(), "cpu_count": os.cpu_count(),
+        "network_cost": windows_network_cost() if os.name == "nt" else {},
         "basic_ready": basic_ready(root), "full_ready": is_ready(root),
         "capabilities": capability_report(root, request),
         "model_provenance": model_provenance(root),
         "installed_packages": {tier: packages_healthy(root, tier)
                                for tier in ("basic", "full")},
-        "offline_import": read_json(root / ".studio" / "offline_import.json", {}),
         "native_video": {"local_model_detected": bool(native_video_model(root)),
                          "load_verified": native_load_ready(root),
                          "verification": read_json(root / ".studio" / "native_ready.json", {}),
@@ -6106,10 +6985,13 @@ def export_black_box(root, request, last_job, notifier, include_private=False):
     diagnostic["error_code"] = latest.get("error_code")
     diagnostic["latest_exception"] = diagnostic_exception_summary(latest["error"]) if isinstance(
         latest.get("error"), str) else None
-    diagnostic["failed_stage"] = next(({"percent": item.get("percent"), "elapsed_seconds": item.get("elapsed_seconds")}
+    diagnostic["failed_stage"] = next(({"percent": item.get("percent"),
+                                        "stage": redact_diagnostic(item.get("step"), "step"),
+                                        "elapsed_seconds": item.get("elapsed_seconds")}
                                        for item in reversed(latest.get("events", [])) if isinstance(item, dict)), None)
     diagnostic["final_review_failure"] = {key: value for key, value in latest.get("final_review", {}).items()
-                                          if key in {"failure_code", "scene", "passed", "review_level"}} if isinstance(
+                                          if key in {"failure_code", "scene", "passed", "review_level",
+                                                     "technical_pass", "semantic_pass", "delivery_allowed"}} if isinstance(
                                               latest.get("final_review"), dict) else {}
     diagnostic["native_verification"] = {key: value for key, value in read_json(
         root / ".studio" / "native_ready.json", {}).items()
@@ -6147,12 +7029,27 @@ def export_black_box(root, request, last_job, notifier, include_private=False):
                                        "voice_exists": bool(item.get("voice") and Path(item["voice"]).is_file()),
                                        "image_type": visual.get("type"),
                                        "caption_pages": len(visual.get("overlays", [])),
-                                       "semantic_passed": visual.get("metrics", {}).get("passed")
+                                       "semantic_passed": visual.get("metrics", {}).get("semantic_passed")
                                        if isinstance(visual.get("metrics"), dict) else None,
                                        "visual_signature_exists": bool(item.get("visual_signature")),
                                        "voice_signature_exists": bool(item.get("voice_signature"))})
     repair_summary = [{"round": item.get("round"), "failure_code": item.get("failure_code"),
                        "at": item.get("at")} for item in latest.get("repairs", []) if isinstance(item, dict)]
+    image_attempts = []
+    continuity_reviews = []
+    if jobpath and jobpath.is_dir():
+        for attempt_file in sorted(jobpath.glob("attempts_*.json")):
+            records = read_json(attempt_file, [])
+            if isinstance(records, list):
+                image_attempts.append({"scene": len(image_attempts), "attempt_count": len(records),
+                                       "failure_types": [record.get("failure_type") for record in records
+                                                         if isinstance(record, dict)]})
+        for checkpoint_file in sorted(jobpath.glob("scene_*.json")):
+            visual = read_json(checkpoint_file, {}).get("image", {})
+            metrics = visual.get("metrics", {}) if isinstance(visual, dict) else {}
+            if isinstance(metrics, dict) and isinstance(metrics.get("continuity"), dict):
+                continuity_reviews.append({"scene": len(continuity_reviews),
+                                            "review": metrics["continuity"]})
     model_progress = []
     for spec in MODEL_SPECS:
         folder = model_path(root, spec[2])
@@ -6203,6 +7100,18 @@ def export_black_box(root, request, last_job, notifier, include_private=False):
                  "power": system_power_state(), "disk_budget": latest.get("disk_budget", {})},
                 ensure_ascii=False, indent=2))
             archive.writestr("diagnostics/model_download_progress.json", json.dumps(model_progress, ensure_ascii=False, indent=2))
+            archive.writestr("diagnostics/install_transaction.json", json.dumps(redact_diagnostic(
+                read_json(root / ".studio" / "install_transaction.json", {})), ensure_ascii=False, indent=2))
+            archive.writestr("diagnostics/document_coverage.json", json.dumps(redact_diagnostic(
+                latest.get("source_analysis", [])), ensure_ascii=False, indent=2))
+            archive.writestr("diagnostics/image_attempts.json", json.dumps(redact_diagnostic(
+                image_attempts), ensure_ascii=False, indent=2))
+            archive.writestr("diagnostics/continuity_reviews.json", json.dumps(redact_diagnostic(
+                continuity_reviews), ensure_ascii=False, indent=2))
+            archive.writestr("diagnostics/final_delivery_gate.json", json.dumps(redact_diagnostic(
+                (read_json(jobpath / "final_reviews.json", [])[-1].get("review_coverage", {})
+                 if jobpath and read_json(jobpath / "final_reviews.json", []) else {})),
+                ensure_ascii=False, indent=2))
             archive.writestr("diagnostics/readme.txt", "诊断包模式：%s。分享前请检查压缩包内容。\n" %
                              ("完整模式：可能包含私人提示词、素材及路径" if include_private else
                               "自动脱敏模式：包含修复、音轨、模型校验等摘要，但不包含原始媒体和输入文本"))
@@ -6274,33 +7183,88 @@ def parse_requested_duration(content):
     content = str(content).lower()
     cn = "零〇一二两三四五六七八九十百"
     number = r"(?:\d{1,4}(?:\.\d+)?|[" + cn + r"]{1,5})"
-    colon = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)", content)
-    patterns = [
-        (r"(?<![A-Za-z0-9])(?P<minute>" + number + r")\s*(?:分钟|分)\s*"
-         r"(?:(?P<seconds>" + number + r")\s*秒(?:钟)?|(?P<half>半)(?:钟)?)?", "minute"),
-        (r"(?<![A-Za-z0-9])半\s*(?:分钟|分)(?:钟)?", "half"),
-        (r"(?<![A-Za-z0-9])(?P<seconds>" + number + r")\s*(?:秒(?:钟)?|s\b)", "second")
-    ]
-    matches = []
-    if colon:
-        minute, second = int(colon.group(1)), int(colon.group(2))
-        if second < 60:
-            matches.append((colon.start(), minute * 60 + second))
-    for pattern, mode in patterns:
-        for result in re.finditer(pattern, content):
-            if mode == "half":
-                seconds = 30
-            elif mode == "minute":
-                mins = chinese_duration_number(result.group("minute"))
-                extra = chinese_duration_number(result.group("seconds")) if result.group("seconds") else 0
-                if mins is None or extra is None:
+    patterns = (
+        (re.compile(r"(?<![a-z0-9])(?P<minutes>" + number +
+                    r")\s*(?:分钟|分)\s*(?:(?P<seconds>" + number + r")\s*秒(?:钟)?|(?P<half>半)(?:钟)?)?"), 60),
+        (re.compile(r"(?<![a-z0-9])半\s*(?:分钟|分)(?:钟)?"), 30),
+        (re.compile(r"(?<![a-z0-9])(?P<seconds>" + number + r")\s*(?:秒(?:钟)?|s\b)"), 1),
+    )
+    candidates = []
+    occupied = []
+    for pattern, scale in patterns:
+        for match in pattern.finditer(content):
+            if any(start < match.end() and match.start() < end for start, end in occupied):
+                continue
+            if scale == 30:
+                seconds = 30.0
+            elif scale == 60:
+                minute_value = chinese_duration_number(match.group("minutes"))
+                seconds_value = (chinese_duration_number(match.group("seconds"))
+                                 if match.group("seconds") else 0)
+                if minute_value is None or seconds_value is None:
                     continue
-                seconds = mins * 60 + extra + (30 if result.group("half") else 0)
+                seconds = minute_value * 60 + seconds_value + (30 if match.group("half") else 0)
             else:
-                seconds = chinese_duration_number(result.group("seconds"))
+                seconds = chinese_duration_number(match.group("seconds"))
             if seconds is not None and seconds > 0:
-                matches.append((result.start(), seconds))
-    return min(matches, key=lambda item: item[0])[1] if matches else None
+                candidates.append((match.start(), match.end(), float(seconds)))
+                occupied.append((match.start(), match.end()))
+    for match in re.finditer(r"(?<!\d)(\d{1,2}):(\d{2})(?![:\d])", content):
+        minutes, seconds = map(int, match.groups())
+        if seconds >= 60:
+            continue
+        before = content[max(0, match.start() - DURATION_TIME_CONTEXT_CHARS):match.start()]
+        if re.search(r"(?:发布|开始|拍摄|今晚|凌晨|上午|下午|早上|晚上|几点|日期|时间|\d{4}[-/.年]\d{1,2})\s*$", before):
+            continue
+        if any(start < match.end() and match.start() < end for start, end in occupied):
+            continue
+        candidates.append((match.start(), match.end(), minutes * 60.0 + seconds))
+    if not candidates:
+        return None
+    duration_markers = (r"(?:总时长|总长度|全片时长|整段时长|成片(?:总)?时长|"
+                        r"视频(?:总)?时长|视频(?:总)?长度|片长|整片时长|时长|duration|"
+                        r"(?:视频|短片|成片)(?:控制在|为|约|长))")
+    local_markers = (r"(?:每(?:个|段|幕|镜头|场景)|各(?:个|段|镜头)|第[一二三四五六七八九十\d]+"
+                     r"(?:个|段|幕|镜头)|前\s*\d*|后\s*\d*|开头|结尾|片头|片尾|"
+                     r"镜头|场景|分镜|转场|展示|走路|解释|讲解|停留|切换)")
+    classified = []
+    for start, end, seconds in candidates:
+        before = content[max(0, start - DURATION_TIME_CONTEXT_CHARS):start]
+        after = content[end:end + DURATION_TIME_CONTEXT_CHARS]
+        short_before = re.split(r"[,，。;；!！?？\n]", before)[-1]
+        short_after = re.split(r"[,，。;；!！?？\n]", after)[0]
+        explicit = bool(re.search(duration_markers + r"\s*[:：=为约在到]?\s*$", short_before) or
+                        re.search(r"^\s*(?:的|为)?\s*(?:总时长|片长|视频时长|成片时长|"
+                                  r"(?:的)?(?:视频|成片|短片|全片))", short_after))
+        local = bool(re.search(local_markers + r"[^,，。;；!！?？\n]{0,9}$", short_before))
+        classified.append((start, seconds, explicit, local))
+    explicit = [item for item in classified if item[2]]
+    if explicit:
+        return min(explicit, key=lambda item: item[0])[1]
+    per_shot = re.search(r"每(?:个|段|幕|镜头|场景)\s*(?:镜头|场景|分镜)?\s*"
+                         r"(?:持续|长|为|约)?\s*(" + number + r")\s*秒", content)
+    shot_count = re.search(r"(?:共|一共|总共|合计)\s*(" + number + r")\s*(?:个|段|幕|场|组)?\s*(?:镜头|场景|分镜|片段)", content)
+    if per_shot and shot_count:
+        per = chinese_duration_number(per_shot.group(1))
+        count = chinese_duration_number(shot_count.group(1))
+        if per and count and count.is_integer() and count <= 100:
+            return per * count
+    nonlocal_values = [item for item in classified if not item[3]]
+    if len(classified) == 1 and nonlocal_values:
+        return nonlocal_values[0][1]
+    if len(nonlocal_values) == 1:
+        return nonlocal_values[0][1]
+    return None
+
+def media_preferences(prompt):
+    content = re.sub(r"\s+", "", str(prompt)).lower()
+    mute_all = bool(re.search(r"完全静音|全程静音|纯静音|无声(?:视频|短片|作品)|没有任何声音|不要任何声音|不需要任何声音|不要声音|不含声音|(?:纯画面|只有画面)(?:、|，|,)?(?:不要声音|无声音|静音)", content))
+    no_voice = bool(re.search(r"无旁白|不要旁白|不需要旁白|没有旁白|禁用旁白|无配音|不要配音|不需要配音|无解说|不要解说|无解说词|无口播|不要口播|无语音|不要语音", content))
+    no_captions = bool(re.search(r"无字幕|不要字幕|不需要字幕|没有字幕|禁用字幕|去掉字幕|无文字叠加|不要文字叠加|不加字幕|纯画面|只有画面", content))
+    no_music = bool(re.search(r"无背景音乐|不要背景音乐|不需要背景音乐|不要配乐|不需要配乐|无配乐|不加音乐|不要音乐|无音乐", content))
+    return {"narration": not (mute_all or no_voice), "subtitles": not no_captions,
+            "music": not (mute_all or no_music), "source_audio": not mute_all,
+            "mute_all": mute_all}
 
 
 def recommend_project_settings(prompt, assets, available_memory=0):
@@ -6325,10 +7289,11 @@ def recommend_project_settings(prompt, assets, available_memory=0):
     requested_seconds = parse_requested_duration(content)
     if requested_seconds is not None:
         rounded = math.ceil(requested_seconds)
-        bounded = max(6, min(120, rounded))
+        bounded = max(MIN_REQUEST_DURATION, min(MAX_REQUEST_DURATION, rounded))
         duration = str(bounded)
         duration_reason = ("已采用提示词指定的时长" if bounded == rounded else
-                           "提示词要求%d秒，已按当前可安全制作的6至120秒范围调整为%d秒" % (rounded, bounded))
+                           "提示词要求%d秒，已按当前可安全制作的%d至%d秒范围调整为%d秒" % (
+                               rounded, MIN_REQUEST_DURATION, MAX_REQUEST_DURATION, bounded))
     elif any(word in content for word in ("一分钟", "1分钟", "60秒", "完整教程", "长故事", "知识科普")):
         duration = "60"
         duration_reason = "讲解内容需要更完整的叙事"
@@ -6564,9 +7529,6 @@ class StudioUI:
         self.start_btn.pack(side="left", padx=(0, 9))
         self.black_btn = ttk.Button(self.footer, text="黑匣子", style="Small.TButton", command=self.blackbox)
         self.black_btn.pack(side="right", padx=(8, 0))
-        self.open_btn = ttk.Button(self.footer, text="打开成品目录", style="Small.TButton",
-                                   command=self.open_output)
-        self.open_btn.pack(side="right")
         self.refresh_asset_label()
         self.refresh_smart_suggestions()
         self.render_task_state("idle")
@@ -6770,12 +7732,17 @@ class StudioUI:
             plan += " · 采用提供的配乐"
         if self.assets["视频"]:
             self.source_audio_role.set("自动混合原声")
-        if available:
+        if self.assets["视频"]:
+            plan += " · 优先理解用户视频并剪辑"
+        elif available:
             plan += " · 优先原生动态，未通过审校时自动改用图片运镜"
         elif self.capabilities.get("full_offline"):
             plan += " · AI 图片动态运镜"
         else:
             plan += " · 离线模型准备中"
+        adjusted = next((reason for reason in proposal["reasons"] if "已按当前可安全制作" in reason), "")
+        if adjusted:
+            plan += " · " + adjusted
         self.recommendation_label.configure(text=plan)
 
     def draw_preview(self, event=None):
@@ -6885,8 +7852,19 @@ class StudioUI:
         width, height = (data.get("resolution") or [0, 0])[:2]
         seconds = data.get("duration", 0)
         scenes = data.get("scene_count", len(self.scene_entries))
-        text = "%s × %s  ·  %.1f 秒  ·  %s 幕\n%s" % (
-            width or "?", height or "?", float(seconds), scenes, output.name)
+        methods = data.get("render_strategy_counts", {})
+        if not isinstance(methods, dict):
+            methods = {}
+        styles = []
+        for key, label in (("cogvideox_generated_motion", "原生 AI 动态镜头"),
+                           ("supplied_video_edit", "用户视频剪辑"),
+                           ("generated_still_camera_motion", "AI 图片运镜"),
+                           ("supplied_still_camera_motion", "用户图片运镜")):
+            if methods.get(key, 0):
+                styles.append("%s %d 幕" % (label, methods[key]))
+        text = "%s × %s  ·  %.1f 秒  ·  %s 幕\n%s\n画面方式：%s" % (
+            width or "?", height or "?", float(seconds), scenes, str(output),
+            "；".join(styles) if styles else "见交付清单")
         warnings = data.get("warnings") or []
         if warnings:
             text += "\n提醒：" + str(warnings[0])[:120]
@@ -7059,9 +8037,6 @@ class StudioUI:
             test.write_bytes(b"OK")
             test.unlink()
             new_lock = WorkspaceLock(root)
-            configure_environment(root)
-            if recover_runtime_transaction(root):
-                self.log("已恢复上次中断部署前的独立运行环境")
         except Exception as error:
             if new_lock:
                 new_lock.close()
@@ -7113,8 +8088,6 @@ class StudioUI:
         busy = self.task not in (None, "部署") or self.blackbox_active
         self.start_btn.configure(state="normal" if self.root_path and not busy and
                                  self.pending_start_request is None else "disabled")
-        self.open_btn.configure(state="normal" if self.last_output and self.last_output.exists()
-                                 else "disabled")
         self.black_btn.configure(state="normal" if self.root_path and not self.blackbox_active else "disabled")
         self.prompt_box.configure(state="normal" if not busy else "disabled")
 
@@ -7130,29 +8103,34 @@ class StudioUI:
         self.capability_label.configure(text=label, fg=self.palette["soft"])
 
 
+    def request_capabilities_cached(self, request):
+        flags = dict(self.capabilities) if isinstance(self.capabilities, dict) else {}
+        files = request.get("files", {}) if isinstance(request, dict) else {}
+        visuals = any(files.get(kind) for kind in ("图片", "首帧", "尾帧", "视频"))
+        flags["visual_assets"] = bool(visuals)
+        flags["native_requested"] = bool(str(request.get("visual_mode", "")).startswith("原生AI视频"))
+        flags["create_allowed"] = bool(flags.get("create_allowed") and flags.get("full_offline"))
+        return flags
+
+    def emit_setup_done(self, completed, message):
+        try:
+            flags = capability_report(self.root_path)
+        except Exception as error:
+            self.log("部署结束时能力检查未完成：" + str(error)[:180])
+            flags = {}
+        self.events.put(("setup_done", completed, message, flags))
+
     def update_setup(self):
         if not self.root_path or self.task or self.blackbox_active or self.setup_active:
             return
-        self.capabilities = capability_report(self.root_path)
-        self.ready = self.capabilities["full_offline"]
-        self.basic_ready = self.capabilities["basic"]
-        last_scan = read_json(self.root_path / ".studio" / "integrity_scan.json", {}).get("at")
-        try:
-            due_scan = (datetime.datetime.now() - datetime.datetime.fromisoformat(last_scan)).days >= 7
-        except (ValueError, TypeError):
-            due_scan = True
-        self.force_integrity_scan = bool(self.ready and due_scan)
-        self.update_capability_label()
-        self.ready_badge.configure(text=("● 完全离线就绪" if self.ready else
-                                         "● 基础离线就绪 · 有画面素材即可创作" if self.basic_ready else
-                                         "● 正在准备离线创作环境"),
-                                    fg=self.palette["green"] if self.ready or self.basic_ready else self.palette["amber"])
         self.install_stop.clear()
         self.task = "部署"
+        self.setup_active = True
+        self.force_integrity_scan = False
         self.setup_progress["value"] = 0
+        self.ready_badge.configure(text="● 正在检查离线创作环境", fg=self.palette["amber"])
         self.set_status("正在后台检查本地创作环境", 1)
         self.refresh_buttons()
-        self.setup_active = True
         self.setup_thread = threading.Thread(target=self.setup_worker, daemon=True)
         self.setup_thread.start()
 
@@ -7174,10 +8152,18 @@ class StudioUI:
 
     def install_dependencies(self, needs_piper=False, tier="basic"):
         root = self.root_path
-        active = root / ".studio" / "venv"
-        backup = root / ".studio" / RUNTIME_BACKUP_FOLDER
-        if backup.exists():
+        folder = root / ".studio"
+        active = folder / "venv"
+        backup = folder / RUNTIME_BACKUP_FOLDER
+        staging = folder / (RUNTIME_BACKUP_FOLDER + ".creating")
+        marker = folder / "packages_ready.json"
+        marker_backup = folder / RUNTIME_MARKER_BACKUP
+        transaction = folder / "install_transaction.json"
+        if backup.is_dir():
             recover_runtime_transaction(root)
+            self.log("检测到部署中断，已恢复上一次验证过的 Python 环境")
+        if staging.is_dir():
+            shutil.rmtree(staging)
         if packages_healthy(root, tier, needs_piper):
             try:
                 self.verify_packages(tier, needs_piper)
@@ -7185,40 +8171,78 @@ class StudioUI:
             except InterruptedError:
                 raise
             except Exception as error:
-                self.log("独立运行库需要重新部署：" + str(error)[:230])
-        budget = installation_disk_budget(root, tier, needs_piper, replacement=True)
+                self.log("独立运行库需要修复：" + str(error)[:230])
+        previous_tier = None
+        if active.is_dir():
+            for candidate in ("full", "basic"):
+                if not packages_healthy(root, candidate, False):
+                    continue
+                try:
+                    self.verify_packages(candidate, False)
+                    previous_tier = candidate
+                    break
+                except InterruptedError:
+                    raise
+                except Exception as error:
+                    self.log("旧组件未通过导入验收，需要重建：" + str(error)[:230])
+        budget = installation_disk_budget(root, tier, needs_piper, replacement=not bool(previous_tier))
         if budget["free"] < budget["required"]:
-            raise RuntimeError("安装空间不足：本阶段预计需要 %.1f GB，可用 %.1f GB。请换更大的工作目录或先导入离线资源包" % (
+            raise RuntimeError("安装空间不足：本阶段预计需要 %.1f GB，可用 %.1f GB。请更换工作目录或使用离线依赖包" % (
                 budget["required"] / GB, budget["free"] / GB))
-        old_manifest = root / ".studio" / "packages_ready.json"
-        original_marker = old_manifest.read_bytes() if old_manifest.is_file() else None
         preserved = active.is_dir()
+        transaction_state = "incremental" if previous_tier else "fresh_or_repair"
         if preserved:
-            os.replace(active, backup)
-            self.log("旧运行环境已备份到工作目录，候选环境验收前不会被删除")
+            marker_backup.unlink(missing_ok=True)
+            if marker.is_file():
+                shutil.copy2(marker, marker_backup)
+            try:
+                if previous_tier:
+                    self.set_status("复用已验收组件，准备安全增量升级", 8)
+                    shutil.copytree(active, staging, copy_function=runtime_snapshot_copy)
+                    os.replace(staging, backup)
+                    self.log("已保存可回滚快照，增量补齐组件而不重新下载 PyTorch")
+                else:
+                    os.replace(active, backup)
+                    self.log("旧环境未通过验收，已隔离保存，准备重新部署")
+            except BaseException:
+                if staging.is_dir():
+                    shutil.rmtree(staging)
+                if backup.is_dir():
+                    recover_runtime_transaction(root)
+                marker_backup.unlink(missing_ok=True)
+                raise
+        atomic_json(transaction, {"started": now_stamp(), "tier": tier,
+                                  "mode": transaction_state, "stage": "installing",
+                                  "baseline": previous_tier, "rollback_available": preserved})
         try:
             self._install_dependencies_in_place(needs_piper, tier)
             if not runtime_matches_host(root) or not packages_healthy(root, tier, needs_piper):
-                raise RuntimeError("新环境的 Python 版本或依赖完整性不合格")
+                raise RuntimeError("升级环境的 Python 版本或依赖完整性不合格")
             self.verify_packages(tier, needs_piper)
-        except BaseException:
-            if preserved:
-                if active.exists():
-                    shutil.rmtree(active)
-                os.replace(backup, active)
-                if original_marker is not None:
-                    old_manifest.write_bytes(original_marker)
-                else:
-                    old_manifest.unlink(missing_ok=True)
-                self.log("已回滚到原有运行环境，避免安装失败损坏已有能力")
+            if previous_tier and (not packages_healthy(root, previous_tier, False)):
+                raise RuntimeError("升级损坏了原有的 %s 离线能力，自动恢复旧环境" % previous_tier)
+            if previous_tier:
+                self.verify_packages(previous_tier, False)
+        except BaseException as error:
+            atomic_json(transaction, {"checked": now_stamp(), "tier": tier, "mode": transaction_state,
+                                      "stage": "rollback", "baseline": previous_tier,
+                                      "error_type": type(error).__name__})
+            if preserved and backup.is_dir():
+                recover_runtime_transaction(root)
+                self.log("已恢复原运行环境与依赖清单，原有离线能力不受失败升级影响")
             else:
                 if active.exists():
                     shutil.rmtree(active)
-                old_manifest.unlink(missing_ok=True)
+                marker.unlink(missing_ok=True)
+                marker_backup.unlink(missing_ok=True)
             raise
         else:
             if backup.exists():
                 shutil.rmtree(backup)
+            marker_backup.unlink(missing_ok=True)
+            atomic_json(transaction, {"checked": now_stamp(), "tier": tier, "mode": transaction_state,
+                                      "stage": "verified", "baseline": previous_tier,
+                                      "rollback_available": False})
 
     def _install_dependencies_in_place(self, needs_piper=False, tier="basic"):
         root = self.root_path
@@ -7279,14 +8303,16 @@ class StudioUI:
             try:
                 run_external([str(python), "-c", "import torch; "
                               "assert torch.__version__.split('+')[0]=='" + TORCH_VERSION + "'; "
-                              "print(torch.__version__, torch.zeros(1).item())"], root,
+                              "print(torch.__version__, torch.zeros(1).item(), "
+                              "'CUDA' if torch.cuda.is_available() else 'CPU')"], root,
                              timeout=120, cancel=self.install_stop,
                              env=shell_env(root, offline=True), capture=True)
             except InterruptedError:
                 raise
             except Exception as error:
                 torch_ok = False
-                self.log("原有 PyTorch 不可用，准备修复：" + str(error)[:300])
+                kind, hint = installation_failure_hint(error)
+                self.log("原有 PyTorch 不可用，准备修复（%s）：%s；%s" % (kind, str(error)[:220], hint))
         if not torch_ok:
             torch_error = None
             torch_sources = ([ ("本地安装包", str(offline_wheels), False) ] if local_wheels else [])
@@ -7310,7 +8336,8 @@ class StudioUI:
                     raise
                 except Exception as error:
                     torch_error = error
-                    self.log("计算引擎安装失败，尝试其它线路：" + str(error)[:320])
+                    kind, hint = installation_failure_hint(error)
+                    self.log("计算引擎安装失败（%s），尝试其它线路：%s；%s" % (kind, str(error)[:240], hint))
             if torch_error:
                 raise RuntimeError("计算引擎无法安装：" + str(torch_error))
         packages = list(CORE_PACKAGE_SPECS)
@@ -7343,7 +8370,8 @@ class StudioUI:
                 raise
             except Exception as error:
                 last_error = error
-                self.log("该线路安装或导入校验失败，尝试其它线路：" + str(error)[:420])
+                kind, hint = installation_failure_hint(error)
+                self.log("依赖线路安装或导入失败（%s），尝试其它线路：%s；%s" % (kind, str(error)[:300], hint))
         if last_error:
             raise RuntimeError("离线组件安装或依赖检查失败：" + str(last_error))
         if tier == "full" and not optional_ocr_ready(root):
@@ -7401,6 +8429,10 @@ class StudioUI:
             return
         gpu = gpu_info()
         power = system_power_state()
+        network_cost = windows_network_cost()
+        if network_cost["metered"] or not network_cost["known"]:
+            self.log("网络为按流量计费或无法确认计费状态，跳过可选大型模型下载以保护流量")
+            return
         available_memory = memory_info().get("available", 0)
         if (gpu.get("total_mb", 0) < NATIVE_AUTO_MIN_TOTAL_MB or
                 gpu.get("free_mb", 0) < NATIVE_VIDEO_MIN_FREE_MB or
@@ -7439,10 +8471,12 @@ class StudioUI:
             current_power = system_power_state()
             ram = memory_info().get("available", 0)
             disk = shutil.disk_usage(root).free
-            if current_power.get("on_battery") or ram < NATIVE_AUTO_MIN_RAM or disk < NATIVE_AUTO_DISK_RESERVE + MIN_INSTALL_FREE:
+            if (current_power.get("on_battery") or ram < NATIVE_AUTO_MIN_RAM or
+                    disk < NATIVE_AUTO_DISK_RESERVE + MIN_INSTALL_FREE or
+                    windows_network_cost().get("metered", True)):
                 atomic_json(record_file, {"checked": datetime.datetime.now().isoformat(),
                                           "status": "resource_paused"})
-                self.log("检测到电池供电或系统资源不足，主动暂停可选大型模型下载")
+                self.log("检测到电池供电、按流量计费网络或系统资源不足，主动暂停可选大型模型下载")
                 return
             try:
                 run_external([str(runtime_python(root)), str(Path(__file__).resolve()),
@@ -7512,6 +8546,7 @@ class StudioUI:
         def monitor():
             busy_streak = 0
             last_cpu = None
+            last_network_check = 0.0
             while not finished.wait(RESOURCE_MONITOR_INTERVAL):
                 try:
                     if self.native_stop.is_set() or self.task == "创作":
@@ -7523,6 +8558,12 @@ class StudioUI:
                         self.log("可选模型下载已让出电量、内存或磁盘资源")
                         self.native_stop.set()
                         return
+                    if time.monotonic() - last_network_check >= NETWORK_COST_CHECK_INTERVAL:
+                        last_network_check = time.monotonic()
+                        if windows_network_cost(force=True).get("metered", True):
+                            self.log("当前网络已按流量计费或计费状态不可确认，暂停可选大模型下载")
+                            self.native_stop.set()
+                            return
                     current_cpu = cpu_time_sample()
                     if current_cpu and last_cpu:
                         total = current_cpu[1] - last_cpu[1]
@@ -7542,21 +8583,34 @@ class StudioUI:
             self.prepare_native_automatically()
             if not self.native_stop.is_set():
                 self.validate_optional_native()
-            self.events.put(("native_done", True))
+            self.events.put(("native_done", True, capability_report(self.root_path)))
         except InterruptedError:
-            self.events.put(("native_done", False))
+            self.events.put(("native_done", False, capability_report(self.root_path)))
         except Exception as error:
             self.log("可选原生模型初始化未完成：" + str(error)[:200])
-            self.events.put(("native_done", False))
+            self.events.put(("native_done", False, capability_report(self.root_path)))
         finally:
             finished.set()
             watcher.join(timeout=1.0)
 
     def setup_worker(self):
         root = self.root_path
-        deep = self.force_integrity_scan
-        self.force_integrity_scan = False
         try:
+            configure_environment(root)
+            preflight = host_install_preflight(root)
+            self.log("设备预检：" + json.dumps(preflight, ensure_ascii=False))
+            if preflight["gpu_mode"] == "cpu_fallback":
+                self.log("未检测到可用的 NVIDIA CUDA 候选设备；Intel/AMD 等显卡可使用保守 CPU 推理路径")
+            if recover_runtime_transaction(root):
+                self.log("已恢复上次中断部署前的独立运行环境")
+            current_flags = capability_report(root)
+            last_scan = read_json(root / ".studio" / "integrity_scan.json", {}).get("at")
+            try:
+                due_scan = (datetime.datetime.now() - datetime.datetime.fromisoformat(last_scan)).days >= 7
+            except (ValueError, TypeError):
+                due_scan = True
+            deep = bool(current_flags.get("full_offline") and due_scan)
+            self.events.put(("setup_scan", current_flags))
             if deep:
                 self.set_status("正在逐一检查模型文件完整 SHA-256", 2)
             if not deep and is_ready(root):
@@ -7564,8 +8618,7 @@ class StudioUI:
                 if not voice_backend_operational(root, diagnostics.get("voice_backend"), force=True):
                     self.log("系统中文语音发生变化，准备修复基础离线配音环境")
                 else:
-                    self.events.put(("setup_done", True,
-                                     "离线创作已就绪；原生视频按本机资源自动选择"))
+                    self.emit_setup_done(True, "离线创作已就绪；原生视频按本机资源自动选择")
                     return
             needs_basic = not basic_ready(root)
             needs_voice = not test_system_chinese_voice(root)
@@ -7617,7 +8670,8 @@ class StudioUI:
                 atomic_json(root / ".studio" / "basic_ready.json",
                             {"runtime_version": RUNTIME_VERSION, "completed": now_stamp(),
                              "python": list(sys.version_info[:2]), "diagnostic": diagnostics})
-            self.events.put(("setup_basic", True, "基础离线创作已就绪，正在补齐图像生成、语义审校和语音识别"))
+            self.events.put(("setup_basic", True, "基础分镜、配音与编码就绪，正在完成生成和 AI 审校组件",
+                             capability_report(root)))
             if self.install_stop.is_set():
                 raise InterruptedError("部署已暂停")
             self.install_dependencies(needs_piper=not test_system_chinese_voice(root), tier="full")
@@ -7626,8 +8680,10 @@ class StudioUI:
             if missing:
                 endpoints = choose_endpoints()
                 self.log("模型线路探测仅用于排序；即使 HEAD/GET 探测失败也直接尝试实际下载")
+                system_idle = (not system_power_state().get("on_battery") and
+                               memory_info().get("available", 0) >= 6 * GB)
                 parallel = (min(MAX_DOWNLOAD_PROCESSES, len(missing)) if
-                            shutil.disk_usage(root).free >= MIN_PARALLEL_DOWNLOAD_FREE and
+                            system_idle and shutil.disk_usage(root).free >= MIN_PARALLEL_DOWNLOAD_FREE and
                             available_threads() >= 3 else 1)
                 self.set_status("补齐 %d 项扩展离线模型" % len(missing), 48)
                 done = 0
@@ -7675,14 +8731,15 @@ class StudioUI:
             if deep:
                 atomic_json(root / ".studio" / "integrity_scan.json", {
                     "at": datetime.datetime.now().isoformat(), "status": "full_model_hashes_verified"})
-            self.events.put(("setup_done", True,
-                             "完整离线能力已验收；动态视频生成方式已自动选择"))
+            self.emit_setup_done(True, "完整离线能力已验收；动态视频生成方式已自动选择")
         except InterruptedError:
-            self.events.put(("setup_done", False, "扩展部署已暂停，下载进度保留"))
+            self.emit_setup_done(False, "扩展部署已暂停，下载进度保留")
         except Exception:
             self.log(traceback.format_exc())
-            explanation = traceback.format_exc().splitlines()[-1][:350]
-            self.events.put(("setup_done", False, "扩展部署未完成：" + explanation + "。可重试继续"))
+            explanation = traceback.format_exc().splitlines()[-1][:280]
+            category, hint = installation_failure_hint(explanation)
+            self.log("部署故障类别：" + category + "；" + hint)
+            self.emit_setup_done(False, "扩展部署未完成：" + explanation + "。" + hint + "；可重试继续")
         finally:
             self.setup_active = False
 
@@ -7706,7 +8763,8 @@ class StudioUI:
                 raise
             except Exception as error:
                 errors.append(str(error)[:260])
-                self.log("%s线路失败：%s" % (spec[0], str(error)[:220]))
+                kind, hint = installation_failure_hint(error)
+                self.log("%s线路失败（%s）：%s；%s" % (spec[0], kind, str(error)[:180], hint))
         raise RuntimeError("模型 %s 未下载成功，可联网重试：%s" % (spec[0], " | ".join(errors)[-550:]))
 
     def verify_runtime(self, tier):
@@ -7729,7 +8787,7 @@ class StudioUI:
         raise RuntimeError("实际离线推理验收不完整（%s），不能宣称完全就绪" % tier)
 
     def resume_setup(self):
-        if not self.root_path or self.task or is_ready(self.root_path):
+        if not self.root_path or self.task or self.ready:
             return
         if self.setup_active:
             self.root.after(600, self.resume_setup)
@@ -7746,13 +8804,7 @@ class StudioUI:
                 "visual_mode": self.visual_mode.get()}
 
     def can_pause_optional_install(self, request):
-        files = request.get("files", {}) if isinstance(request, dict) else {}
-        has_visual = any(files.get(role) for role in ("图片", "首帧", "尾帧", "视频"))
-        if not has_visual:
-            return bool(capability_report(self.root_path, request)["create_allowed"])
-        if self.basic_ready or (self.root_path / ".studio" / "basic_ready.json").is_file():
-            return True
-        return bool(capability_report(self.root_path, request)["create_allowed"])
+        return bool(self.request_capabilities_cached(request).get("create_allowed"))
 
     def start_job(self):
         if not self.root_path or self.task not in (None, "部署") or self.blackbox_active:
@@ -7766,19 +8818,19 @@ class StudioUI:
         if absent:
             self.messagebox.showerror(APP_NAME, "以下素材已不可用：\n" + "\n".join(absent[:4]))
             return
-        self.capabilities = capability_report(self.root_path, request)
         self.native_stop.set()
+        request_flags = self.request_capabilities_cached(request)
         if self.task == "部署" or self.setup_active:
             self.pending_start_request = request
             if self.can_pause_optional_install(request):
                 self.install_stop.set()
                 self.set_status("已有能力可完成本次创作，正在暂停扩展安装并释放资源")
             else:
-                self.set_status("已接收创作需求，继续准备所需离线模型；基础可用时优先启动")
+                self.set_status("已接收创作需求，正在完成完整离线模型与 AI 审核的验收")
             self.refresh_buttons()
             self.root.after(220, self.launch_queued_job)
             return
-        if not self.capabilities["create_allowed"]:
+        if not request_flags["create_allowed"]:
             self.pending_start_request = request
             self.set_status("已接收创作需求，所需模型尚未全部就绪；部署完成后自动启动")
             self.refresh_buttons()
@@ -7805,20 +8857,24 @@ class StudioUI:
             self.root.after(220, self.launch_queued_job)
             return
         request = self.pending_start_request
-        self.capabilities = capability_report(self.root_path, request)
-        if not self.capabilities["create_allowed"]:
-            self.set_status("所需模型尚未验收：提供画面素材可使用基础离线剪辑，否则需等待完整部署")
+        request_flags = self.request_capabilities_cached(request)
+        if not request_flags["create_allowed"]:
+            self.pending_start_request = None
+            self.set_status("部署未完成：所需模型尚未验收；可检查工作目录/网络并重新点击启动重试")
+            self.refresh_buttons()
             return
         self.pending_start_request = None
         self.launch_job(request)
 
     def launch_job(self, request):
-        try:
-            self.capabilities = require_request_capabilities(self.root_path, request)
-        except (RuntimeError, OSError) as error:
-            self.set_status("任务启动前能力检查失败：" + str(error)[:230])
+        flags = self.request_capabilities_cached(request)
+        if not flags.get("create_allowed"):
+            self.set_status("当前所需的离线创作能力尚未验收，请重试部署")
             self.refresh_buttons()
             return
+        if flags.get("native_requested") and not flags.get("native_video"):
+            request["visual_mode"] = "智能轻量运镜"
+            self.log("大型原生视频尚未验收，采用离线图片动态运镜")
         if self.task is not None or self.setup_active or (self.setup_thread and self.setup_thread.is_alive()):
             self.pending_start_request = request
             self.root.after(180, self.launch_queued_job)
@@ -7887,18 +8943,6 @@ class StudioUI:
             stop_file.unlink(missing_ok=True)
             self.job_stop_file = None
 
-    def open_output(self):
-        if not self.last_output:
-            return
-        folder = self.last_output.parent
-        try:
-            if os.name == "nt":
-                os.startfile(str(folder))
-            else:
-                subprocess.Popen(["xdg-open", str(folder)])
-        except OSError as error:
-            self.messagebox.showerror(APP_NAME, "打开文件夹失败：" + str(error))
-
     def blackbox(self):
         if not self.root_path or self.blackbox_active:
             return
@@ -7953,8 +8997,21 @@ class StudioUI:
                             state = "active" if kind == "scene_active" else "reviewing" if kind == "scene_review" else "done"
                             self.render_scene_state(index, state, data.get("preview"),
                                                     str(data.get("review", "")))
+                elif category == "setup_scan":
+                    if self.task != "部署":
+                        continue
+                    self.capabilities = dict(event[1])
+                    self.ready = bool(self.capabilities.get("full_offline"))
+                    self.basic_ready = bool(self.capabilities.get("basic"))
+                    self.ready_badge.configure(text=("● 完全离线就绪" if self.ready else
+                                                     "● 基础离线就绪 · 有画面素材即可创作" if self.basic_ready else
+                                                     "● 正在准备离线创作环境"),
+                                               fg=self.palette["green"] if self.ready or self.basic_ready
+                                               else self.palette["amber"])
+                    self.update_capability_label()
+                    self.refresh_buttons()
                 elif category == "setup_basic":
-                    self.capabilities = capability_report(self.root_path)
+                    self.capabilities = dict(event[3])
                     self.update_capability_label()
                     self.ready = False
                     self.basic_ready = bool(event[1])
@@ -7969,10 +9026,10 @@ class StudioUI:
                     if self.task != "部署":
                         continue
                     self.task = None
-                    self.capabilities = capability_report(self.root_path)
+                    self.capabilities = dict(event[3])
                     self.update_capability_label()
-                    self.ready = self.capabilities["full_offline"]
-                    self.basic_ready = self.capabilities["basic"]
+                    self.ready = bool(self.capabilities.get("full_offline"))
+                    self.basic_ready = bool(self.capabilities.get("basic"))
                     self.ready_badge.configure(text=("● 完整离线就绪 · 原生视频已实测" if self.capabilities.get("native_video")
                                                      else "● 完整离线就绪 · 智能图片运镜") if self.ready else
                                                "● 基础离线就绪 · 用户素材可创作" if self.basic_ready else
@@ -7996,7 +9053,13 @@ class StudioUI:
                         backoff = min(15 * 60 * 1000, 20 * 1000 * (2 ** min(5, self.deployment_retry - 1)))
                         self.root.after(backoff, self.update_setup)
                     if self.pending_start_request is not None:
-                        self.root.after(180, self.launch_queued_job)
+                        if self.request_capabilities_cached(self.pending_start_request)["create_allowed"]:
+                            self.root.after(180, self.launch_queued_job)
+                        elif not event[1]:
+                            self.pending_start_request = None
+                            self.stage_label.configure(text=(message + "；可再次点击启动尝试部署")[:250],
+                                                       fg=self.palette["danger"])
+                            self.refresh_buttons()
                     elif self.ready:
                         self.root.after(450, self.start_native_background)
                 elif category == "job_done":
@@ -8019,25 +9082,8 @@ class StudioUI:
                     self.root.after(450, self.resume_setup)
                     if event[1]:
                         self.root.after(800, self.start_native_background)
-                elif category == "cache_done":
-                    self.task = None
-                    self.stage_label.configure(text=event[2],
-                                               fg=self.palette["green"] if event[1] else self.palette["danger"])
-                    self.refresh_buttons()
-                elif category == "import_done":
-                    self.task = None
-                    self.stage_label.configure(text=event[2], fg=self.palette["green"] if event[1]
-                                               else self.palette["danger"])
-                    self.refresh_buttons()
-                    if event[1]:
-                        self.root.after(150, self.update_setup)
-                elif category == "cleanup_done":
-                    self.task = None
-                    self.stage_label.configure(text=event[2], fg=self.palette["green"] if event[1]
-                                               else self.palette["amber"])
-                    self.refresh_buttons()
                 elif category == "native_done":
-                    self.capabilities = capability_report(self.root_path)
+                    self.capabilities = dict(event[2])
                     self.update_capability_label()
                     self.refresh_smart_suggestions()
                 elif category == "black_done":
@@ -8083,6 +9129,8 @@ def main():
         raise SystemExit("需要 Python 3.10–3.13 的 64 位解释器")
     if os.name != "nt":
         raise SystemExit("本程序仅支持 Windows 11 x64")
+    if sys.getwindowsversion().build < WINDOWS_11_MIN_BUILD:
+        raise SystemExit("需要 Windows 11（系统内部版本 22000 或更高）")
     if args and args[0] == "--fetch-native" and len(args) == 3:
         download_native_worker(args[1], args[2])
         return
